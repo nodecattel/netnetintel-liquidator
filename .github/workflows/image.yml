@@ -1,0 +1,36 @@
+# Builds the liquidator's image from this repository's source and publishes it to GitHub's container registry, for
+# Intel/AMD and ARM computers (Apple chip Macs and Raspberry Pis included). Runs the tests first.
+name: image
+on:
+  push: { branches: [main] }
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci && npm test
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - id: v
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/netnetintel-liquidator:latest
+            ghcr.io/${{ github.repository_owner }}/netnetintel-liquidator:${{ steps.v.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/netnetintel-liquidator:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Self-run liquidation bot for the NetNet Loopback market on Morpho Blue
+            org.opencontainers.image.licenses=MIT

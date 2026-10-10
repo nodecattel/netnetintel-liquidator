@@ -1,0 +1,25 @@
+# docker compose up -d     (settings in .env next to this file: copy .env.example to .env)
+# One-time wallet setup first: docker compose run --rm liquidator new-wallet
+services:
+  liquidator:
+    image: ghcr.io/nodecattel/netnetintel-liquidator:latest
+    # build: .              # or build from this folder
+    container_name: netnetintel-liquidator
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - liquidator-data:/data
+    # The keystore password as a file instead of an env var (recommended):
+    #   echo 'your password' > keystore_password.txt && chmod 600 keystore_password.txt
+    #   then uncomment the two blocks below and remove KEYSTORE_PASSWORD from .env
+    # secrets: [keystore_password]
+    # environment:
+    #   KEYSTORE_PASSWORD_FILE: /run/secrets/keystore_password
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+# secrets:
+#   keystore_password:
+#     file: ./keystore_password.txt
+volumes:
+  liquidator-data:
