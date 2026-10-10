@@ -64,7 +64,7 @@ const cfg = (x = {}) => ({ live: false, tickSeconds: 2, fullEverySeconds: 30, ho
 test('start: finds borrowers from Borrow logs and checks the market is the expected one', async () => {
   const { rpc } = fakeChain();
   const bot = makeBot({ rpc, cfg: cfg(), store: memStore(), log: quiet });
-  await bot.start();
+  await bot.start(); await bot.scanDone();
   assert.deepEqual([...bot.known].sort(), [BAD, GOOD].sort());
 });
 

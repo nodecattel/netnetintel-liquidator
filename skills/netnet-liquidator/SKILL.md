@@ -77,6 +77,7 @@ After a restart the wallet stays locked until they log in on the page (Telegram 
 |---|---|
 | Is it running? | `docker ps --filter name=netnet-liq` |
 | Recent log | `docker logs --tail 50 netnet-liq` |
+| Follow it live | `docker logs -f netnet-liq` (add `-e LOG_LEVEL=debug` to the run line for a line per check) |
 | Update | Run the starter again, or `docker pull ghcr.io/nodecattel/netnetintel-liquidator:latest && docker rm -f netnet-liq` then the `docker run` line again. The volume keeps the wallet and settings. |
 | Stop completely | `docker stop netnet-liq` (again: `docker start netnet-liq`) |
 
@@ -88,7 +89,8 @@ After a restart the wallet stays locked until they log in on the page (Telegram 
 - "Open this page at http://localhost:8788": the page only answers on localhost.
 - Forgot the page password: it also encrypts the key, so it can't be reset. The user restores the wallet from the 12 words: stop the container, start a new one with a new volume name, and import the words on its page. Don't delete the old volume until the funds are confirmed in the new wallet.
 - "Needs ETH for gas" when going live: the bot wallet has no ETH on Robinhood Chain. A little ETH must be sent there (not on Ethereum or another chain).
-- "RPC problem" on the page: the public Robinhood Chain RPC is busy. The user can add their own RPC in Settings.
+- "RPC problem" or balances not showing: the page says what the RPC answered. The public Robinhood Chain RPC is shared and rate-limited; the user can paste their own (Chainstack, QuickNode, Blockdaemon, dRPC, Validation Cloud, GlobalStake) in Settings → Speed. That needs their page password, so it's their step.
+- "NetNet Intel API not reachable" in the log: harmless. The bot finds the loans on chain instead (a minute on the public RPC).
 - Telegram link lost: make a new code with /liquidator and paste it in Settings → Telegram.
 
 Source and full README: https://github.com/nodecattel/netnetintel-liquidator

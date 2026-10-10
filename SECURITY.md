@@ -27,9 +27,18 @@ LLTV).
 hash. Through it the bot sends reports, and the only thing it reads back is whether you paused it. Telegram can't
 change limits, switch live on, or move funds. Unlink any time from the page or the chat.
 
-**What leaves your machine.** JSON-RPC calls to your RPC, reports to netnetintel.com when Telegram is linked (amounts,
-loan addresses, transaction hashes, a status line), and Telegram messages if you set your own bot token. No analytics.
-Your key, phrase and password never leave the machine.
+**What leaves your machine.** JSON-RPC calls to your RPC (and the public RPC when yours fails); signed transactions
+to the RPC and to Robinhood Chain's sequencer; reads of NetNet Intel's public API (the open loans and the market:
+nothing about you is sent, `INTEL_API=off` turns it off); reports to netnetintel.com when Telegram is linked (amounts,
+deposits, loan addresses, transaction hashes, a status line); and Telegram messages if you set your own bot token. No
+analytics. Your key, phrase and password never leave the machine.
+
+**What it trusts.** Only the chain. NetNet Intel's loan list decides which loans are read first, never an amount: the
+bot reads each loan, the price and the wallet from the chain before it sizes or sends anything. A wrong or hostile
+list can't make it send more, or anywhere else.
+
+**Funds that leave on their own.** If a balance drops and the bot didn't send anything, the page and Telegram say so
+at once. If that wasn't you, treat the key as exposed and withdraw what's left.
 
 **AI assistants.** An assistant can install Docker and start the container. It never needs your key, phrase,
 password or pairing code; if one was pasted into a chat, treat it as exposed (see AGENTS.md).

@@ -2,7 +2,7 @@
 // liquidation's state), the oracle, the IRM, USDG/wsNET balances; and a fake relay.
 import { AbiCoder, Interface, getAddress } from 'ethers';
 import { MORPHO_IFACE, ERC20 } from '../src/chain.mjs';
-import { MORPHO, MARKET_ID, USDG, WSNET, LLTV, TOPIC_BORROW } from '../src/constants.mjs';
+import { MORPHO, MARKET_ID, USDG, WSNET, NET, SNET, LLTV, TOPIC_BORROW } from '../src/constants.mjs';
 
 export const enc = (types, vals) => AbiCoder.defaultAbiCoder().encode(types, vals);
 export const ORACLE = '0xCDE9599059f8Ae6D6B9F33A0aF7877827ec75F16', IRM = '0x2bd3d5965b26b51814ac95127b2b80dd6ccc0fa1';
@@ -12,10 +12,12 @@ export const MARKET = [0xf5fd8bc4efn, 0x0def89a96c5155e3n, 0xc18987993en, 0x0aed
 export const POS = { [BAD]: [0n, 0xaf7e4472bb2an, 0x062c14a2a08dc62en], [GOOD]: [0n, 0xaf7e4472bb2an, 0x062c14a2a08dc62en * 3n] };
 const ERRORS = new Interface(['function Error(string)']);
 
-export function fakeAnswer({ usdg = 1000n * 10n ** 6n, eth = 10n ** 16n, allowance = 0n, priceReverts = false, liquidateReason = null } = {}) {
+// Balances are read from `o` on every call, so a test can change them between reads (a deposit, funds moved).
+export function fakeAnswer(o = {}) {
   const seen = [];
   const answer = (c) => {
-    if (c.method === 'eth_blockNumber') return { result: '0x50b0000' };
+    const { usdg = 1000n * 10n ** 6n, eth = 10n ** 16n, allowance = 0n, priceReverts = false, liquidateReason = null, wsnet = 0n, net = 0n, snet = 0n } = o;
+    if (c.method === 'eth_blockNumber') return { result: '0x' + (o.nodeHead ?? 0x50b0000).toString(16) };
     if (c.method === 'eth_getBlockByNumber') return { result: { number: '0x50b0000', timestamp: '0x' + TS.toString(16) } };
     if (c.method === 'eth_getBalance') return { result: '0x' + eth.toString(16) };
     if (c.method === 'eth_gasPrice') return { result: '0x131a230' };
@@ -32,9 +34,11 @@ export function fakeAnswer({ usdg = 1000n * 10n ** 6n, eth = 10n ** 16n, allowan
     }
     if (t === ORACLE.toLowerCase()) return priceReverts ? { error: { code: 3, message: 'execution reverted' } } : { result: enc(['uint256'], [PRICE]) };
     if (t === IRM.toLowerCase()) return { result: enc(['uint256'], [0x2d95795f6n]) };
-    if (t === USDG.toLowerCase() && sel === ERC20.getFunction('balanceOf').selector) return { result: enc(['uint256'], [usdg]) };
+    if (t === USDG.toLowerCase() && sel === ERC20.getFunction('balanceOf').selector) return o.usdgError ? { error: { code: -32005, message: 'rate limited' } } : { result: enc(['uint256'], [usdg]) };
     if (t === USDG.toLowerCase() && sel === ERC20.getFunction('allowance').selector) return allowance === 'unreadable' ? { error: { code: -32005, message: 'rate limited' } } : { result: enc(['uint256'], [allowance]) };
-    if (t === WSNET.toLowerCase()) return { result: enc(['uint256'], [0n]) };
+    if (t === WSNET.toLowerCase()) return { result: enc(['uint256'], [wsnet]) };
+    if (t === NET.toLowerCase()) return { result: enc(['uint256'], [net]) };
+    if (t === SNET.toLowerCase()) return { result: enc(['uint256'], [snet]) };
     return { error: { message: 'unknown call' } };
   };
   return { answer, seen };
@@ -49,7 +53,14 @@ export function fakeRpc(opts) {
 export function fakeFetch(opts = {}) {
   const { answer } = fakeAnswer(opts);
   const relayCalls = [];
-  const fn = async (url, init) => {
+  const intelCalls = [];
+  const fn = async (url, init = {}) => {
+    if (String(url).includes('/api/v1/')) {      // NetNet Intel's API: the open loans and the market around them
+      intelCalls.push(String(url));
+      if (opts.intel === false) return new Response(JSON.stringify({ error: 'down' }), { status: 503 });
+      if (String(url).includes('/loop/liquidations')) return new Response(JSON.stringify(INTEL_LIQS));
+      return new Response(JSON.stringify(intelLoop(opts.intelLoans ?? [BAD, GOOD])));
+    }
     const body = JSON.parse(init.body);
     if (String(url).includes('liquidatorRelay')) {
       relayCalls.push(body);
@@ -60,9 +71,17 @@ export function fakeFetch(opts = {}) {
     const out = arr.map((c) => ({ jsonrpc: '2.0', id: c.id, ...answer(c) }));
     return new Response(JSON.stringify(Array.isArray(body) ? out : out[0]));
   };
-  fn.relayCalls = relayCalls;
+  fn.relayCalls = relayCalls; fn.intelCalls = intelCalls;
   return fn;
 }
+// what netnetintel.com/api/v1/loop and /loop/liquidations answer (trimmed to the fields the bot reads)
+export const intelLoop = (accounts) => ({ block: 0x50b0000, asOf: '2026-10-10T03:40:51.961Z', matched: accounts.length,
+  summary: { positions: accounts.length, liquidatableNow: 1, byStatus: { 'AT RISK': { loans: 1 }, 'WIND DOWN': { loans: 0 } }, totalDebtUsdg: 855000, borrowApy: 0.12 },
+  mark: { twap: 182.73, spot: 199.83, stakingIndex: 3.43, oraclePerWsNet: 616.9, marketPerWsNet: 685.4, floorTwap: 200.13, paused: false },
+  loans: accounts.map((a, i) => ({ account: a.toLowerCase(), debtUsdg: 100 + i, health: 0.97 + i })) });
+export const INTEL_LIQS = { windows: { h24: { n: 12, repaid: 7969.65, profitOracle: 1010.24, liquidators: 4 } },
+  leaders: { total: 58000, liquidators: 7, rows: [{ liquidator: '0x72512e63c0c70797b96902228fa8acc1211b7cee', n: 17, repaid: 43536.36, share: 0.75 }] },
+  recent: [{ ts: 1791595505, repaid: 2492.19, liquidator: '0x3586aa1db9523bb223916b8ec0405261c8a625e1', tx: '0xb285e901ccb3fdf8f8194a24514cda12aeafb1e77d3c86c096851737c941ff7d' }] };
 export function fakeSender(address) {
   const sent = [];
   return {
@@ -71,4 +90,4 @@ export function fakeSender(address) {
     send: async (tx) => { sent.push(tx); return { hash: '0x' + String(sent.length).padStart(64, '0'), wait: async () => ({ status: 1, logs: [] }) }; },
   };
 }
-export const quiet = { info() {}, warn() {}, error() {}, recent: () => [] };
+export const quiet = { info() {}, warn() {}, error() {}, debug: null, recent: () => [] };

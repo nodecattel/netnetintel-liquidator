@@ -136,3 +136,27 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:6px;backgroun
 .bridge{display:block;padding:10px 12px;border:1px solid var(--line);border-radius:6px;text-decoration:none;background:var(--soft)}
 .bridge:hover{border-color:var(--brand)}.bridge b{display:block;color:var(--fg);font-size:13px}.bridge span{color:var(--muted);font-size:12px}
 .checks{margin-top:2px}
+
+/* balances, market context, transactions, activity */
+.bal td{padding:7px 4px}.bal td:first-child{font-weight:500}.bal td .muted{font-weight:400;font-size:11.5px;margin-left:4px}
+.bal tr.zero td{color:var(--muted)}.bal tr:last-child td{border-bottom:0}
+.bal tr.new td{background:color-mix(in srgb,var(--brand) 9%,transparent)}.plus{color:var(--brand);font-size:11.5px;margin-left:4px}
+.irows{margin-top:12px;border-top:1px solid var(--line);padding-top:6px}
+.irows div{display:flex;justify-content:space-between;gap:10px;padding:4px 0;font-size:12.5px}
+.irows span{color:var(--muted)}.irows b{font-weight:500;text-align:right;font-variant-numeric:tabular-nums}.irows b code{font-size:12px}
+.feed{list-style:none;margin:0;padding:0}.feed li{padding:7px 0;border-bottom:1px solid var(--line);font-size:13px;color:var(--fg);display:flex;gap:10px}
+.feed li:last-child{border:0}.feed time{color:var(--muted);font-size:11px;min-width:64px;flex:none;font-variant-numeric:tabular-nums;padding-top:1px}
+.feed li.ok{color:var(--brand)}.feed li.warn{color:var(--warn)}.feed li.bad{color:var(--bad)}
+.st{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.st.ok{color:var(--brand);border-color:color-mix(in srgb,var(--brand) 45%,transparent)}.st.warn,.st.wait{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,transparent)}
+.st.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
+.txs td{vertical-align:top}.txs .hint{font-size:11.5px;max-width:420px}
+.eps td{vertical-align:top;font-size:12.5px}.eps td:first-child{color:var(--muted);white-space:nowrap;width:1%}
+.warn-t{color:var(--warn)}
+#fulllog .log{margin-top:8px}
+@media (max-width:560px){.txs th:nth-child(4),.txs td:nth-child(4){display:none}.feed time{min-width:52px}}
+td code{white-space:nowrap}.log div{overflow-wrap:anywhere}
+@media (max-width:560px){.bal td .muted{display:none}}
+.providers{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin:6px 0 4px}
+.providers a{display:block;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--soft);text-decoration:none;font-size:12.5px;font-weight:500}
+.providers a:hover{border-color:var(--brand)}

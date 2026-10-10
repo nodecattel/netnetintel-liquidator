@@ -4,14 +4,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeRunner } from '../src/runner.mjs';
 import { startServer } from '../src/server.mjs';
-import { fakeFetch, fakeSender, quiet } from './fake.mjs';
+import { fakeFetch, fakeSender } from './fake.mjs';
+import { makeLog } from '../src/io.mjs';
 const out = process.argv[2];
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');   // npm i -D playwright, or point PLAYWRIGHT_MODULE at an install
 const code = 'nnlq_' + 'A'.repeat(43);
 const errors = [];
+const say = console.log; console.log = () => {};   // the bot's own terminal log stays quiet here
 for (const [name, vp] of Object.entries({ phone: { width: 390, height: 844 }, desktop: { width: 1280, height: 900 } })) {
   const DATA_DIR = mkdtempSync(join(tmpdir(), 'liqui-'));
-  const runner = await makeRunner({ env: { DATA_DIR }, log: { ...quiet, recent: () => [{ t: Date.now(), level: 'info', msg: '758 wallets have borrowed on Loopback' }, { t: Date.now(), level: 'info', msg: '[dry run] full bid on 0x847f…42f3: repay 203.69 USDG, seize 0.3132 wsNET (229.51 USDG at the oracle, +25.82): Morpho accepts the bid' }] }, fetchImpl: fakeFetch({ relayToken: code, eth: 0n, usdg: 0n }), makeSender: (w) => fakeSender(w.address) });
+  const chain = { relayToken: code, eth: 0n, usdg: 0n };   // balances the walk changes: deposits arrive mid-way
+  const runner = await makeRunner({ env: { DATA_DIR }, log: makeLog(), fetchImpl: fakeFetch(chain), makeSender: (w) => fakeSender(w.address) });
   const server = startServer({ runner, port: 0, host: '127.0.0.1' });
   await new Promise((r) => server.once('listening', r));
   const base = `http://localhost:${server.address().port}`;
@@ -29,14 +32,21 @@ for (const [name, vp] of Object.entries({ phone: { width: 390, height: 844 }, de
   await page.check('#ok'); await page.click('#go'); await page.waitForSelector('.words3');
   for (const id of await page.$$eval('.words3 input', (xs) => xs.map((x) => x.id))) await page.fill('#' + id, words[Number(id.slice(1))]);
   await shot('4-check');
-  await page.click('#go'); await page.waitForSelector('.bridges'); await runner.bot.start(); await runner.bot.tick(); await page.waitForTimeout(5500); await shot('5-fund');
+  await page.click('#go'); await page.waitForSelector('.bridges'); await runner.bot.refreshWallet(); await page.waitForTimeout(5500); await shot('5-fund');
+  chain.eth = 5n * 10n ** 14n; chain.usdg = 250n * 10n ** 6n; chain.net = 2n * 10n ** 9n;   // the owner funds it
+  await runner.bot.refreshWallet(); await page.waitForTimeout(5500); await shot('5b-funded');
   await page.click('#go'); await page.waitForSelector('#max'); await shot('6-limits');
   await page.fill('#max', '300'); await page.click('#save'); await page.waitForSelector('#code'); await shot('7-telegram');
   await page.fill('#code', code); await page.click('#pair');
-  await runner.bot.start(); await runner.bot.tick();
+  await runner.bot.start(); await runner.intel.refresh(); await runner.bot.tick();
   await page.waitForSelector('#settings'); await page.reload(); await page.waitForSelector('#settings'); await shot('8-dashboard');
-  if (!(await page.isDisabled('#live'))) errors.push(name + ': Go live is enabled without ETH or USDG');
+  if (await page.isDisabled('#live')) errors.push(name + ': Go live is disabled though funded');
+  await page.click('#live'); await page.fill('#conf', 'LIVE'); await page.click('#golive'); await page.waitForSelector('#dry');
+  await runner.bot.tick(); await page.reload(); await page.waitForSelector('#settings'); await shot('9-live');
+  await page.click('#fulllog summary'); await page.waitForTimeout(3500); await shot('9b-log');
+  if (!(await page.$eval('#fulllog', (d) => d.open))) errors.push(name + ': the log closed on refresh');
   await page.click('#settings'); await page.waitForSelector('#back'); await shot('10-settings');
   await browser.close(); server.close();
 }
+console.log = say;
 console.log(errors.length ? 'ERRORS\n' + errors.join('\n') : 'no errors');

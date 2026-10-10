@@ -6,14 +6,15 @@
 //   new-wallet           make a fresh wallet, saved as an encrypted keystore in the data folder
 //   import-key           encrypt an existing private key into the keystore
 //   withdraw <address> [usdg|wsnet|all]   send the bot wallet's USDG and/or wsNET to your own address
-import { JsonRpcProvider, getAddress } from 'ethers';
-import { CHAIN_ID, USDG, WSNET, EXPLORER_TX, EXPLORER_ADDR } from './constants.mjs';
+import { getAddress } from 'ethers';
+import { USDG, WSNET, EXPLORER_TX, EXPLORER_ADDR } from './constants.mjs';
 import { configFrom, describe } from './config.mjs';
 import { makeRpc, readTick, ERC20 } from './chain.mjs';
 import { loadWallet, newWallet, importKey, terminalPrompt, keySource } from './wallet.mjs';
 import { makeStore, makeLog, makeNotify } from './io.mjs';
-import { makeBot } from './bot.mjs';
-import { makeRunner, VERSION } from './runner.mjs';
+import { makeBot, TOKENS, fmtTok } from './bot.mjs';
+import { makeRunner, VERSION, senderOf as makeSender } from './runner.mjs';
+import { makeIntel, intelBase } from './intel.mjs';
 import { startServer } from './server.mjs';
 import { makeSettings, effectiveEnv } from './settings.mjs';
 import { accrue, positionView, fmtUsdg, fmtWs } from './math.mjs';
@@ -21,21 +22,13 @@ import { accrue, positionView, fmtUsdg, fmtWs } from './math.mjs';
 const env = process.env;
 const [cmd = 'run', ...args] = process.argv.slice(2);
 
-function senderOf(wallet, cfg) {
-  const provider = new JsonRpcProvider(cfg.rpcUrl, { chainId: CHAIN_ID, name: 'robinhood' }, { staticNetwork: true, batchMaxCount: 1 });
-  const signer = wallet.connect(provider);
-  return {
-    address: wallet.address,
-    estimateGas: (tx) => signer.estimateGas({ ...tx, from: wallet.address }),
-    send: async (tx) => { const r = await signer.sendTransaction({ ...tx, chainId: CHAIN_ID }); return { hash: r.hash, wait: () => r.wait(1, 120_000) }; },
-  };
-}
+const senderOf = (wallet, cfg) => makeSender(wallet, cfg.rpcUrl, { sequencerUrl: cfg.sequencerUrl });
 
 async function main() {
   // the local page's saved settings apply to every command; a non-empty environment variable wins
   const saved = makeSettings(env.DATA_DIR || '/data').get();
   const cfg = configFrom(effectiveEnv(env, saved).env);
-  const log = makeLog({ json: cfg.jsonLogs });
+  const log = makeLog({ json: cfg.jsonLogs, debug: cfg.debug });
   const prompt = terminalPrompt();
 
   if (cmd === 'new-wallet') {
@@ -65,12 +58,14 @@ async function main() {
 
   const store = makeStore(cfg.dataDir);
   const notify = makeNotify(env, log);
-  const bot = makeBot({ rpc, logsRpc, sender: wallet ? senderOf(wallet, cfg) : null, cfg, store, log, notify });
+  const intel = makeIntel({ base: intelBase(env), version: VERSION });
+  const bot = makeBot({ rpc, logsRpc, sender: wallet ? senderOf(wallet, cfg) : null, cfg, store, log, notify, seed: intel.enabled ? () => intel.loans() : null });
   const params = await bot.start();
+  await bot.scanDone();
 
   if (cmd === 'scan' || cmd === 'status') {
     const view = await readTick(rpc, params, wallet?.address ?? null, [...bot.known]);
-    if (wallet) console.log(`\nBot wallet ${wallet.address}\n  ${fmtUsdg(view.wallet.usdg)} USDG · ${fmtWs(view.wallet.wsnet)} wsNET · ${(Number(view.wallet.eth) / 1e18).toFixed(6)} ETH · Morpho may take ${fmtUsdg(view.wallet.allowance)} USDG\n  ${EXPLORER_ADDR}${wallet.address}`);
+    if (wallet) { const w = view.wallet, t = (k) => `${fmtTok(w[k], k)} ${TOKENS[k].sym}`; console.log(`\nBot wallet ${wallet.address}\n  ${['eth', 'usdg', 'wsnet', 'net', 'snet'].map(t).join(' · ')} · Morpho may take ${w.allowance == null ? '?' : fmtUsdg(w.allowance)} USDG\n  ${EXPLORER_ADDR}${wallet.address}`); }
     if (view.price == null) { console.log('\nThe oracle gives no price right now (its guard holds): no loan can be liquidated.'); return; }
     const m = accrue(view.market, view.rate, view.block.timestamp);
     const rows = [...view.positions].filter(([, p]) => p.borrowShares > 0n).map(([b, p]) => ({ b, p, v: positionView(p, m, view.price, params.lltv) })).sort((a, b) => a.v.health - b.v.health);

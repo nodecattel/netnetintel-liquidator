@@ -8,8 +8,14 @@ liquidation bonus).
 - **Your wallet, on your machine.** The key is encrypted with your page password and never leaves the computer.
 - **A page to run it**, at http://localhost:8788: make the wallet, fund it, set limits, link Telegram, go live.
 - **Dry run by default.** It finds and simulates liquidations and sends nothing until you press *Go live*.
-- **Telegram**, through @netnetintel_bot: each liquidation, misses, low gas, and pause/resume from your phone.
-  Telegram can't change limits, switch live on or move funds.
+- **Telegram**, through @netnetintel_bot: deposits, each liquidation, misses, low gas, funds that leave the wallet
+  without the bot sending them, and pause/resume from your phone. Telegram can't change limits, switch live on or
+  move funds.
+- **Starts in seconds.** It loads the open Loop loans from [NetNet Intel's API](https://netnetintel.com/api/v1) and
+  reads the wallet right away, then scans the whole chain in the background for anything the list missed. The API is
+  only a head start: every amount the bot acts on is read from the chain.
+- **Sees what it does.** The page lists the wallet (ETH, USDG, wsNET, NET, sNET), each deposit, every transaction it
+  sent (with status, block and fee) and a short activity feed; the terminal has the full log.
 - It sends only three kinds of transaction: Morpho `liquidate()` on the Loopback market, a USDG approval for Morpho
   (your spending limit, never unlimited), and transfers to **your own saved address**.
 
@@ -81,16 +87,52 @@ seized amounts equal the Liquidate event's.
   liquidations. The bot waits and resumes on its own.
 - **Profit is in wsNET.** The 12.7% bonus is valued at the oracle price, which credits wsNET at 90% of the NET TWAP.
   What it is worth later depends on NET's price.
-- **Competition.** Other liquidators watch the same market. Your own RPC (Settings → Speed) helps. A miss costs
-  nothing: the simulation catches it before sending.
+- **Competition.** Other liquidators watch the same market. Your own RPC (Settings → Speed) helps, and every signed
+  transaction also goes straight to Robinhood Chain's sequencer. A miss costs nothing: the simulation catches it
+  before sending.
 - **Gas.** Paid in ETH. A liquidation costs about 0.000005 ETH at Robinhood Chain's usual 0.02 gwei, so 0.0005 ETH lasts
   about 100. The page shows how many your ETH covers; Telegram warns when it runs low.
+
+## Speed: RPC endpoints
+
+The bot starts on Robinhood Chain's public endpoints. They are shared and rate-limited, fine for a dry run, not
+ideal when racing other liquidators. For live use, get your own RPC from a provider (most have a free tier) and paste
+it in **Settings → Speed**:
+
+| Provider | Sign up / docs |
+|---|---|
+| Chainstack | https://chainstack.com/build-better-with-robinhood-chain/ |
+| QuickNode | https://www.quicknode.com/chains/robinhood |
+| Blockdaemon | https://docs.blockdaemon.com/docs/how-to-connect-to-robinhood |
+| dRPC | https://drpc.org/chainlist/robinhood-testnet-rpc |
+| Validation Cloud | https://www.validationcloud.io/robinhood |
+| GlobalStake | https://globalstake.io |
+
+If your RPC stops answering, the bot reads through the public one until it is back (and says so on the page and in
+the log). If it caps `eth_getLogs` (QuickNode: 10,000 blocks), leave *RPC for finding borrowers* on the public RPC.
+
+Public endpoints (mainnet):
+
+| Endpoint | URL | Used by the bot |
+|---|---|---|
+| RPC | `https://rpc.mainnet.chain.robinhood.com` | the default, and the fallback |
+| Sequencer | `https://sequencer.mainnet.chain.robinhood.com` | every signed transaction is also sent here (`SEQUENCER_URL=off` to stop) |
+| Sequencer feed | `wss://feed.mainnet.chain.robinhood.com` | no |
+| Sequencer feed, delayed backup (~500 ms behind) | `wss://delayed-feed.mainnet.chain.robinhood.com` | no |
+
+## Logs
+
+- **The page** keeps it short: the wallet, transactions, the last few events, and the recent log behind *Full log*.
+- **The terminal** has everything: `docker logs -f netnet-liq`. Each transaction shows when it is sent and when it
+  confirms (block and fee). Add `-e LOG_LEVEL=debug` to the `docker run` line for a line per check (block, loans read,
+  timings, which RPC answered) and the chain scan's progress.
 
 ## Everyday commands
 
 | Task | Command |
 |---|---|
 | Recent log | `docker logs --tail 50 netnet-liq` |
+| Follow the log | `docker logs -f netnet-liq` |
 | Update | Run the starter again (or `docker pull …` then the `docker run` line again). The volume keeps everything |
 | Stop / start | `docker stop netnet-liq` / `docker start netnet-liq` |
 

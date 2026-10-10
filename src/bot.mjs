@@ -4,8 +4,8 @@
 //   Morpho.liquidate on the Loopback market · USDG.approve(Morpho) · wsNET/USDG transfer to the owner's PAYOUT_ADDRESS
 //   (or, from the withdraw command, the address the owner types).
 import { getAddress, MaxUint256, AbiCoder, keccak256 } from 'ethers';
-import { MORPHO, MARKET_ID, MARKET_FROM_BLOCK, MARKET_PARAMS, USDG, EXPLORER_TX } from './constants.mjs';
-import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, scanBorrowers, simulate } from './chain.mjs';
+import { MORPHO, MARKET_ID, MARKET_FROM_BLOCK, MARKET_PARAMS, USDG, WSNET, EXPLORER_TX } from './constants.mjs';
+import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, readWallet, scanBorrowers, simulate } from './chain.mjs';
 import { accrue, positionView, planBid, fmtUsdg, fmtWs } from './math.mjs';
 
 // Interest keeps accruing between the read and the block the bid lands in: bids are sized (and approvals set) on the
@@ -24,27 +24,57 @@ export function gasView(gasPrice, eth) {
 }
 export const marketIdOf = (p) => keccak256(AbiCoder.defaultAbiCoder().encode(['address', 'address', 'address', 'address', 'uint256'], [p.loanToken, p.collateralToken, p.oracle, p.irm, p.lltv]));
 const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+// a contract said no (revert, custom error), as opposed to the RPC failing to answer
+export const isRevert = (e) => e?.code === 'CALL_EXCEPTION' || e?.code === 3 || /revert|execution reverted|healthy/i.test(String(e?.shortMessage || e?.reason || e?.message || ''));
 const LIQ_TOPIC = MORPHO_IFACE.getEvent('Liquidate').topicHash;
 
-// onEvent(ev): what happened, for Telegram and the local page — { kind: 'liquidated' | 'failed' | 'gas' | 'oracle' | 'approved', … }
-export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg, store, log, notify = async () => {}, onEvent = () => {}, nowMs = () => Date.now() }) {
+// Wallet balances: units per token, the smallest change worth a word, and how a change is shown
+export const TOKENS = { eth: { dec: 18, dust: 10n ** 12n, sym: 'ETH' }, usdg: { dec: 6, dust: 10_000n, sym: 'USDG' }, wsnet: { dec: 18, dust: 10n ** 12n, sym: 'wsNET' },
+  net: { dec: 9, dust: 1_000n, sym: 'NET' }, snet: { dec: 9, dust: 1_000n, sym: 'sNET' } };
+export const toNum = (v, k) => (v == null ? null : Number(v) / 10 ** TOKENS[k].dec);
+export const fmtTok = (v, k) => { const n = toNum(v, k); return n == null ? '—' : n.toLocaleString('en-US', { maximumFractionDigits: k === 'usdg' ? 2 : k === 'eth' ? 6 : 4, minimumFractionDigits: k === 'usdg' ? 2 : 0 }); };
+// The bot's own transactions explain a drop in the wallet (and the wsNET a liquidation seizes) until a read at or after
+// the block they landed in; one that never confirmed is given at most OWN_MAX_MS.
+const OWN_MAX_MS = 30 * 60_000;
+
+// onEvent(ev): what happened, for Telegram and the local page — { kind: 'liquidated' | 'deposit' | 'outflow' | 'tx' | … }
+// seed(): optional, the open loans from NetNet Intel's API ({ accounts, block }): a head start, never trusted for amounts.
+export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg, store, log, notify = async () => {}, onEvent = () => {}, nowMs = () => Date.now(), seed = null }) {
   let sender = initialSender, me = sender?.address ?? null;
   let paused = false;               // the owner's pause (local page or Telegram): keep watching, send nothing
   let params = null;
   const debts = new Map();          // borrower → debt (USDG units) at the last read
-  let lastView = null, lastTickAt = null, lastError = null, lastReady = 0, started = false, scan = null;
+  let lastView = null, lastTickAt = null, lastError = null, lastReady = 0, started = false, phase = 'connecting';
   const emit = (ev) => { try { onEvent({ at: nowMs(), ...ev }); } catch { /* a reporter never stops the loop */ } };
+  const dbg = (m) => { if (log.debug) log.debug(m); };
   const liveNow = () => !!(cfg.live && sender && !paused);
+  const needLive = () => { if (!liveNow()) throw new Error('paused or switched to dry run before it was sent'); };
   const known = new Set(store.borrowers().map((a) => getAddress(a)));
   const health = new Map();          // borrower → last health (debt > 0 only)
   const cooldown = new Map();        // borrower → ms until which it is skipped
   const said = new Map();            // message key → last time, to keep the log quiet
   const fresh = new Set();           // borrowers found since the last full read: read on the next tick
-  let cursor = store.cursor ?? MARKET_FROM_BLOCK - 1, rate = null, lastFull = 0, lastHead = null, pausedSince = null, lastSummary = 0, busy = false;
+  // the chain scan: `scanned` is the last block every Borrow up to is known (saved); `cursor` is where new blocks are read
+  // from each tick. At start the scan from `scanned` to the head runs in the background (`backfill`), so the bot
+  // watches the loans it already knows (and NetNet Intel's list) from the first second.
+  let scanned = store.cursor ?? MARKET_FROM_BLOCK - 1, cursor = scanned, backfill = null, backfillDone = false, backfillRetryAt = 0;
+  let rate = null, lastFull = 0, lastHead = null, pausedSince = null, lastSummary = 0, busy = false, ticks = 0;
+  let wallet = null, walletAt = null, walletBlock = 0, seen = null, walletLogged = false, backfillPromise = null;
+  const own = { pending: 0, open: false, settleBlock: null, until: 0 };
+  let sending = Promise.resolve();   // one transaction at a time: two at once could take the same nonce
+  // a restart between a send and the next read: the saved balances predate the transaction, so its effect is not news
+  // (only a transaction newer than the saved balances, or one whose outcome is unknown, opens that window)
+  { const ws = store.walletSeen?.(); if (ws?.at && (store.txs?.() || []).some((t) => t.status === 'unknown' || Date.parse(t.at) >= ws.at)) Object.assign(own, { open: true, until: nowMs() + OWN_MAX_MS }); }
+  // addresses only NetNet Intel listed: watched, but saved only once the chain shows a loan (a wrong list can't grow the file)
+  const seededOnly = new Set();
 
   const once = (key, everyMs, f) => { if (said.size > 2000) said.clear(); const t = said.get(key); if (t && nowMs() - t < everyMs) return; said.set(key, nowMs()); f(); };
+  const saveScan = () => store.setScan(backfillDone ? cursor : scanned, [...known].filter((a) => !seededOnly.has(a) || health.has(a)));
+  const loadSeen = () => { const w = store.walletSeen?.(); seen = w && me && w.address === me ? Object.fromEntries(Object.entries(w.bal).map(([k, v]) => [k, v == null ? null : BigInt(v)])) : null; };
+  loadSeen();
 
   async function start() {
+    phase = 'connecting';
     if (marketIdOf(MARKET_PARAMS) !== MARKET_ID) throw new Error('the pinned market parameters do not hash to the Loopback market id');
     const onChain = await readParams(rpc);
     const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
@@ -52,19 +82,44 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       || !same(onChain.irm, MARKET_PARAMS.irm) || onChain.lltv !== MARKET_PARAMS.lltv)
       throw new Error('this RPC does not return the Loopback market as it is on Robinhood Chain: check RPC_URL');
     params = MARKET_PARAMS;   // from here on only the pinned parameters are used
+    phase = 'loading';
     const head = parseInt(await logsRpc.one('eth_blockNumber', []), 16) - LOG_LAG;
-    if (cursor < head) {
-      const from = cursor + 1;
-      log.info(`finding borrowers: blocks ${from.toLocaleString()} → ${head.toLocaleString()}${known.size ? ` (${known.size} known)` : ' (first run, a minute or two)'}`);
-      scan = { from, to: head, at: from, found: known.size };
-      const found = await scanBorrowers(logsRpc, from, head, { range: cfg.logRange, minRange: cfg.minLogRange, onProgress: (b, n) => { scan = { ...scan, at: b, found: n + known.size }; } });
-      scan = null;
-      for (const a of found) known.add(a);
-      cursor = head; store.setScan(cursor, known);
+    if (seed) {
+      const t0 = nowMs();
+      try {
+        const s = await seed();
+        let added = 0;
+        for (const a of s?.accounts || []) { if (!known.has(a)) { known.add(a); seededOnly.add(a); added++; } fresh.add(a); }
+        log.info(`NetNet Intel: ${s?.accounts?.length ?? 0} open loans loaded in ${nowMs() - t0} ms${added ? ` (${added} new here)` : ''}`);
+        if (added) saveScan();
+      } catch (e) { log.warn(`NetNet Intel API not reachable (${e.message}): finding the loans on chain instead`); }
     }
-    log.info(`${known.size} wallets have borrowed on Loopback`);
-    started = true;
+    cursor = Math.max(cursor, head);
+    if (scanned < head) startBackfill(scanned + 1, head);
+    else { backfillDone = true; saveScan(); }
+    log.info(`watching ${known.size} borrower wallets${backfillDone ? '' : ` · scanning the chain since block ${(scanned + 1).toLocaleString('en-US')} in the background`}`);
+    started = true; phase = 'watching';
     return params;
+  }
+
+  // every Borrow since the market opened (or since the last run), in the background; new borrowers join at once
+  function startBackfill(from, to) {
+    if (backfill?.running) return;
+    const t0 = nowMs(), before = known.size;
+    backfill = { from: backfill?.from ?? from, to, at: from - 1, running: true, error: null };
+    dbg(`chain scan: blocks ${from} → ${to}`);
+    backfillPromise = scanBorrowers(logsRpc, from, to, { range: cfg.logRange, minRange: cfg.minLogRange, onProgress: (b, n, added) => {
+      backfill.at = b;
+      for (const a of added) { seededOnly.delete(a); if (!known.has(a)) { known.add(a); fresh.add(a); } }
+      once('scanprog', 5_000, () => dbg(`chain scan: block ${b.toLocaleString('en-US')} (${Math.floor(((b - backfill.from) / Math.max(1, to - backfill.from)) * 100)}%), ${known.size} borrowers`));
+    } }).then(() => {
+      backfill = { ...backfill, at: to, running: false }; backfillDone = true; scanned = to; saveScan();
+      log.info(`chain scan done in ${((nowMs() - t0) / 1000).toFixed(1)} s: ${known.size} wallets have borrowed on Loopback${known.size > before ? ` (${known.size - before} more than NetNet Intel's open list)` : ''}`);
+    }, (e) => {
+      backfill = { ...backfill, running: false, error: e.message }; backfillRetryAt = nowMs() + 60_000;
+      if (backfill.at >= from) { scanned = backfill.at; saveScan(); }
+      once('backfill', 600_000, () => log.warn(`chain scan paused at block ${backfill.at.toLocaleString('en-US')} (${e.message}); retrying in a minute`));
+    });
   }
 
   // new borrowers since the last look: one eth_getLogs over the blocks since
@@ -77,10 +132,88 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       if (head <= cursor) return;
       const found = await scanBorrowers(logsRpc, cursor + 1, head, { range: Math.max(cfg.logRange, head - cursor), minRange: cfg.minLogRange });
       let added = 0;
-      for (const a of found) { if (!known.has(a)) { known.add(a); added++; } fresh.add(a); }
+      for (const a of found) { seededOnly.delete(a); if (!known.has(a)) { known.add(a); added++; } fresh.add(a); }
       cursor = head;
-      if (added) { store.setScan(cursor, known); log.info(`${added} new borrower${added > 1 ? 's' : ''}`); }
+      if (added) { saveScan(); log.info(`${added} new borrower${added > 1 ? 's' : ''}`); }
+      else if (backfillDone && head - (store.cursor ?? 0) > 50_000) saveScan();   // keep the saved cursor near the head
     } catch (e) { once('discover', 60_000, () => log.warn(`could not read new borrowers: ${e.message}`)); }
+  }
+
+  // ---- the wallet: balances for the page (a value that didn't read keeps the last good one), deposits, and funds that
+  // left without the bot sending them. Bids never use these merged values: they use the tick's own read.
+  function trackWallet(w, blk = null) {
+    if (!me || !w) return wallet;
+    if (blk != null && blk < walletBlock) { dbg(`wallet read from block ${blk}, behind ${walletBlock}: ignored`); return wallet; }   // a node behind the last one
+    if (blk != null) walletBlock = blk;
+    const merged = { ...(wallet || {}) };
+    for (const [k, v] of Object.entries(w)) if (v != null) merged[k] = v;
+    wallet = merged; walletAt = nowMs();
+    if (!walletLogged && wallet.eth != null) {
+      walletLogged = true;
+      log.info(`bot wallet ${short(me)}: ${['eth', 'usdg', 'wsnet', 'net', 'snet'].filter((k) => k === 'eth' || k === 'usdg' || wallet[k] > 0n).map((k) => `${fmtTok(wallet[k], k)} ${TOKENS[k].sym}`).join(' · ')}`);
+    }
+    if (own.open && nowMs() >= own.until && !own.pending) own.open = false;
+    const mine = own.pending > 0 || own.open;                                 // the bot's own transactions are still settling
+    const cur = Object.fromEntries(Object.keys(TOKENS).map((k) => [k, wallet[k] ?? null]));
+    if (seen) for (const k of Object.keys(TOKENS)) {
+      const a = seen[k], b = cur[k];
+      if (a == null || b == null || w[k] == null) continue;                    // only what this read actually saw
+      const d = b - a;
+      if (d > TOKENS[k].dust) {
+        if (k === 'wsnet' && mine) continue;                                   // seized by the bot's own liquidation
+        if (k === 'snet' && a > 0n && d * 50n < a) { dbg(`sNET rebase: +${fmtTok(d, k)}`); continue; }   // under 2%: the staking rebase
+        log.info(`received ${fmtTok(d, k)} ${TOKENS[k].sym} · balance ${fmtTok(b, k)}`);
+        emit({ kind: 'deposit', token: TOKENS[k].sym, amount: toNum(d, k), balance: toNum(b, k), address: me });
+      } else if (-d > TOKENS[k].dust) {
+        if (mine) { dbg(`${TOKENS[k].sym} −${fmtTok(-d, k)}: the bot's own transaction`); continue; }
+        log.warn(`${fmtTok(-d, k)} ${TOKENS[k].sym} left the bot wallet, not sent by this bot · balance ${fmtTok(b, k)}`);
+        emit({ kind: 'outflow', token: TOKENS[k].sym, amount: toNum(-d, k), balance: toNum(b, k), address: me });
+      }
+    }
+    // a read at or after the block the bot's last transaction landed in: its effect is now in the balances
+    if (own.open && !own.pending && own.settleBlock != null && blk != null && blk >= own.settleBlock) own.open = false;
+    const changed = !seen || Object.keys(TOKENS).some((k) => cur[k] !== seen[k]);
+    seen = cur;
+    if (changed) store.setWalletSeen?.(me, Object.fromEntries(Object.entries(cur).map(([k, v]) => [k, v == null ? null : String(v)])));
+    return wallet;
+  }
+  /** The wallet alone: while the bot is starting (or can't), the page still shows balances and deposits. */
+  async function refreshWallet() {
+    if (!me) return null;
+    const r = await readWallet(rpc, me);
+    if (r.gasPrice != null) lastView = { ...(lastView || {}), gasPrice: r.gasPrice };
+    return trackWallet(r.wallet, r.block);
+  }
+
+  // ---- every transaction the bot sends goes through here: the terminal, the page's Transactions and Telegram see it ----
+  function sendTx(kind, tx, note, { check = null } = {}) {
+    const run = sending.then(() => sendOne(kind, tx, note, check));
+    sending = run.catch(() => null);
+    return run;
+  }
+  async function sendOne(kind, tx, note, check) {
+    if (!sender) throw new Error('the wallet is locked');
+    if (check) check();                                  // re-checked when its turn comes: paused or dry run since → not sent
+    own.pending++; own.open = true; own.until = nowMs() + OWN_MAX_MS; own.settleBlock = null;   // settled by this one's block, not an earlier one's
+    const rec = { at: new Date(nowMs()).toISOString(), kind, note, status: 'pending', hash: null };
+    try {
+      let sent;
+      try { sent = await sender.send(tx); }
+      catch (e) { rec.status = 'failed'; rec.error = String(e.shortMessage || e.message).slice(0, 200); store.recordTx?.(rec); log.warn(`tx ${kind} not sent: ${note} (${rec.error})`); emit({ kind: 'tx', tx: { ...rec } }); throw e; }
+      rec.hash = sent.hash; store.recordTx?.(rec);
+      log.info(`tx ${kind} sent: ${note} · ${EXPLORER_TX}${sent.hash}`);
+      let receipt = null;
+      try { receipt = await sent.wait(); } catch (e) { rec.error = String(e.shortMessage || e.message).slice(0, 200); }
+      rec.status = receipt ? (receipt.status === 1 ? 'ok' : 'reverted') : 'unconfirmed';
+      if (receipt?.blockNumber != null) { rec.block = Number(receipt.blockNumber); own.settleBlock = Math.max(own.settleBlock ?? 0, rec.block); }
+      const gp = receipt?.gasPrice ?? receipt?.effectiveGasPrice;
+      if (receipt?.gasUsed != null) { rec.gasUsed = Number(receipt.gasUsed); if (gp != null) rec.feeEth = Number(BigInt(receipt.gasUsed) * BigInt(gp)) / 1e18; }
+      store.recordTx?.(rec);
+      const how = rec.status === 'ok' ? `confirmed${rec.block ? ` in block ${rec.block.toLocaleString('en-US')}` : ''}${rec.feeEth != null ? ` · fee ${rec.feeEth.toFixed(8)} ETH` : ''}` : rec.status;
+      (rec.status === 'ok' ? log.info : log.warn)(`tx ${kind} ${how}`);
+      emit({ kind: 'tx', tx: { ...rec } });
+      return { hash: sent.hash, receipt };
+    } finally { own.pending--; }
   }
 
   async function tick() {
@@ -92,7 +225,9 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   }
 
   async function tickInner() {
-    const now = nowMs();
+    const now = nowMs(), t0 = Date.now();
+    ticks++;
+    if (!backfillDone && !backfill?.running && now >= backfillRetryAt && backfill) startBackfill(Math.max(scanned, backfill.at) + 1, cursor);
     await discover(lastHead);
     const full = now - lastFull >= cfg.fullEverySeconds * 1000;
     const list = full ? [...known] : [...known].filter((a) => fresh.has(a) || (health.get(a) ?? Infinity) < cfg.hotHealth);
@@ -103,7 +238,11 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     if (full) lastFull = now;
     fresh.clear();
     lastHead = view.block?.number ?? lastHead;
-    lastView = { block: view.block, wallet: view.wallet, price: view.price, gasPrice: view.gasPrice };
+    const spend = view.wallet;                                // this tick's read: what bids and approvals use (unread → none)
+    const wallet = trackWallet(view.wallet, view.block?.number ?? null);
+    lastView = { block: view.block, price: view.price, gasPrice: view.gasPrice };
+    const st = rpc.stats?.();
+    dbg(`tick ${ticks} · block ${view.block?.number?.toLocaleString('en-US') ?? '?'} · read ${list.length}${full ? ' (all)' : ''} loans in ${Date.now() - t0} ms${st ? ` · rpc ${st.host} ~${st.ms} ms${st.fallback ? ' (fallback)' : ''}` : ''}${view.price == null ? ' · oracle paused' : ''}`);
 
     if (view.price == null) {
       if (!pausedSince) { pausedSince = now; log.warn('the oracle is not giving a price (its guard holds while the pool sits more than 15% under the TWAP): no liquidations until it does'); notify('Loopback oracle paused: no liquidations until it gives a price again.'); emit({ kind: 'oracle', paused: true }); }
@@ -123,18 +262,19 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     }
     if (full) for (const b of known) if (!view.positions.has(b)) { health.delete(b); debts.delete(b); }
     lastReady = ready.length;
+    if (ready.length) dbg(`liquidatable: ${ready.map((r) => `${short(r.borrower)} ${(Math.floor(r.view.health * 1e4) / 1e4).toFixed(4)}`).join(', ')}`);
 
-    const wallet = view.wallet;
-    if (cfg.live && me && wallet && wallet.eth < cfg.gasFloorWei) once('gas', 3_600_000, () => { log.warn(`the wallet has ${(Number(wallet.eth) / 1e18).toFixed(6)} ETH for gas: top it up`); notify(`Liquidator wallet ${short(me)} is low on ETH for gas.`); emit({ kind: 'gas', eth: Number(wallet.eth) / 1e18 }); });
+    if (cfg.live && me && wallet?.eth != null && wallet.eth < cfg.gasFloorWei) once('gas', 3_600_000, () => { log.warn(`the wallet has ${(Number(wallet.eth) / 1e18).toFixed(6)} ETH for gas: top it up`); notify(`Liquidator wallet ${short(me)} is low on ETH for gas.`); emit({ kind: 'gas', eth: Number(wallet.eth) / 1e18 }); });
     summary(now, wallet, ready.length);
     const idle = async () => {
-      if (liveNow()) try { await keepApproved(wallet); } catch (e) { once('approve', 600_000, () => log.warn(`could not set the USDG approval: ${e.shortMessage || e.message}`)); }
+      if (liveNow()) try { await keepApproved(spend); } catch (e) { once('approve', 600_000, () => log.warn(`could not set the USDG approval: ${e.shortMessage || e.message}`)); }
     };
     if (!ready.length) { await idle(); return { ready: 0 }; }
 
     const budgetOf = () => {
-      if (!wallet) return cfg.maxRepay ?? 10n ** 15n;       // no wallet (scan mode): size bids as if funds were plenty
-      let b = wallet.usdg - cfg.reserve;
+      if (!me) return cfg.maxRepay ?? 10n ** 15n;           // no wallet (scan mode): size bids as if funds were plenty
+      if (spend?.usdg == null) return 0n;                    // unread this tick: no bid on a guess
+      let b = spend.usdg - cfg.reserve;
       if (cfg.maxRepay != null && b > cfg.maxRepay) b = cfg.maxRepay;
       return b > 0n ? b : 0n;
     };
@@ -147,11 +287,11 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       if (t.plan.skip) {
         once(`skip:${t.borrower}`, 600_000, () => log.info(`${short(t.borrower)} is liquidatable (health ${t.view.health.toFixed(4)}, debt ${fmtUsdg(t.view.debt)} USDG) but skipped: ${t.plan.skip}`));
         // a chance missed for want of USDG: worth telling the owner, at most hourly
-        if (liveNow()) once('nofunds', 3_600_000, () => emit({ kind: 'nofunds', borrower: t.borrower, debt: fmtUsdg(t.view.debt), usdg: wallet ? fmtUsdg(wallet.usdg) : null }));
+        if (liveNow()) once('nofunds', 3_600_000, () => emit({ kind: 'nofunds', borrower: t.borrower, debt: fmtUsdg(t.view.debt), usdg: spend?.usdg != null ? fmtUsdg(spend.usdg) : null }));
         continue;
       }
       if (t.plan.profit < cfg.minProfit) { once(`small:${t.borrower}`, 600_000, () => log.info(`${short(t.borrower)}: a bid earns ${fmtUsdg(t.plan.profit)} USDG at the oracle, under MIN_PROFIT_USDG`)); continue; }
-      results.push(await act(t, wallet));
+      results.push(await act(t, spend));
       break;                                            // one liquidation per tick: balances change after it
     }
     if (!results.length) await idle();                  // nothing to bid on (or all skipped): keep the approval ready
@@ -181,22 +321,28 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       try { gas = await sender.estimateGas(tx); }
       catch (e) {
         const reason = e.shortMessage || e.reason || e.message;
+        if (!isRevert(e)) {                                // the RPC failed, not Morpho: a failure to report, not a miss
+          log.warn(`${short(borrower)}: not sent, the gas estimate failed (${reason})`);
+          cooldown.set(borrower, now + 5_000);
+          once(`failed:${borrower}`, 600_000, () => emit({ kind: 'failed', borrower, error: `RPC: ${String(reason).slice(0, 140)}` }));
+          return { sent: false, borrower, reason };
+        }
         log.info(`${short(borrower)}: not sent, Morpho would refuse it now (${reason}); someone may have got there first`);
         cooldown.set(borrower, now + 10_000);
         once(`missed:${borrower}`, 600_000, () => emit({ kind: 'missed', borrower, reason: String(reason).slice(0, 120) }));
         return { sent: false, borrower, reason };
       }
-      log.info(`sending ${what}`);
-      const sent = await sender.send({ ...tx, gasLimit: (gas * 13n) / 10n });
-      const rec = await sent.wait();
-      if (!rec || rec.status !== 1) throw new Error(`the transaction reverted (${EXPLORER_TX}${sent.hash})`);
+      let sent, rec;
+      ({ hash: sent, receipt: rec } = await sendTx('liquidate', { ...tx, gasLimit: (gas * 13n) / 10n }, what, { check: needLive }));
+      sent = { hash: sent };
+      if (!rec || rec.status !== 1) throw new Error(`the transaction ${rec ? 'reverted' : 'was not confirmed in 2 minutes'} (${EXPLORER_TX}${sent.hash})`);
       const ev = rec.logs.find((l) => l.address?.toLowerCase() === MORPHO.toLowerCase() && l.topics?.[0] === LIQ_TOPIC);
       const d = ev ? MORPHO_IFACE.decodeEventLog('Liquidate', ev.data, ev.topics) : null;
       const repaid = d ? d.repaidAssets : plan.repaid, seized = d ? d.seizedAssets : plan.seized;
       const entry = { at: new Date().toISOString(), tx: sent.hash, borrower, repaid: fmtUsdg(repaid), seized: fmtWs(seized), badDebt: d ? fmtUsdg(d.badDebtAssets) : null, profitAtOracle: fmtUsdg((seized * t.plan.valueAtOracle) / (t.plan.seized || 1n) - repaid) };
       store.record(entry);
-      emit({ kind: 'liquidated', ...entry });
-      log.info(`liquidated ${short(borrower)}: repaid ${entry.repaid} USDG, seized ${entry.seized} wsNET · ${EXPLORER_TX}${sent.hash}`);
+      emit({ kind: 'liquidated', ...entry, at: nowMs() });
+      log.info(`liquidated ${short(borrower)}: repaid ${entry.repaid} USDG, seized ${entry.seized} wsNET (≈ +${entry.profitAtOracle} USDG at the oracle)`);
       await notify(`Liquidated ${short(borrower)} on Loopback: repaid ${entry.repaid} USDG, seized ${entry.seized} wsNET (≈ +${entry.profitAtOracle} USDG at the oracle).\n${EXPLORER_TX}${sent.hash}`);
       if (cfg.payout) await payout(seized);
       cooldown.set(borrower, now + 5_000);
@@ -214,7 +360,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   // while idle so a bid doesn't wait on it. That much, never unlimited. An allowance that didn't read is left alone
   // while idle (no approval resent on a flaky read); before a bid it is set.
   async function keepApproved(wallet, need = null) {
-    if (!wallet || (need == null && wallet.allowance == null)) return;
+    if (!wallet || wallet.usdg == null || (need == null && wallet.allowance == null)) return;
     let want = wallet.usdg - cfg.reserve;
     if (cfg.maxRepay != null && want > cfg.maxRepay) want = cfg.maxRepay;
     if (need != null && need > want) want = need;
@@ -223,18 +369,15 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   }
   async function approve(amount, wallet) {
     if (amount > MaxUint256) amount = MaxUint256;
-    log.info(`approving Morpho to take up to ${fmtUsdg(amount)} USDG from the bot wallet`);
-    const sent = await sender.send({ to: USDG, data: ERC20.encodeFunctionData('approve', [MORPHO, amount]) });
-    const rec = await sent.wait();
-    if (!rec || rec.status !== 1) throw new Error('the USDG approval failed');
+    if (!liveNow()) throw new Error('paused or in dry run');
+    const { hash, receipt } = await sendTx('approve', { to: USDG, data: ERC20.encodeFunctionData('approve', [MORPHO, amount]) }, `let Morpho take up to ${fmtUsdg(amount)} USDG for liquidations`, { check: needLive });
+    if (!receipt || receipt.status !== 1) throw new Error('the USDG approval failed');
     if (wallet) wallet.allowance = amount;
-    emit({ kind: 'approved', usdg: fmtUsdg(amount), tx: sent.hash });
+    emit({ kind: 'approved', usdg: fmtUsdg(amount), tx: hash });
   }
   async function payout(amount) {
     try {
-      const sent = await sender.send({ to: WSNET, data: ERC20.encodeFunctionData('transfer', [cfg.payout, amount]) });
-      await sent.wait();
-      log.info(`sent ${fmtWs(amount)} wsNET to ${cfg.payout}`);
+      await sendTx('payout', { to: WSNET, data: ERC20.encodeFunctionData('transfer', [cfg.payout, amount]) }, `${fmtWs(amount)} wsNET to your main wallet ${short(cfg.payout)}`, { check: needLive });
     } catch (e) { log.warn(`the seized wsNET stays in the bot wallet: sending it to PAYOUT_ADDRESS failed (${e.shortMessage || e.message})`); }
   }
 
@@ -243,30 +386,39 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     lastSummary = now;
     const close = [...health.entries()].sort((a, b) => a[1] - b[1]);
     const near = close[0] ? `closest ${short(close[0][0])} at ${close[0][1].toFixed(3)}× health` : 'no open loans';
-    const w = wallet ? ` · wallet ${fmtUsdg(wallet.usdg)} USDG, ${fmtWs(wallet.wsnet)} wsNET, ${(Number(wallet.eth) / 1e18).toFixed(5)} ETH` : '';
+    const w = wallet ? ` · wallet ${fmtTok(wallet.usdg, 'usdg')} USDG, ${fmtTok(wallet.wsnet, 'wsnet')} wsNET, ${fmtTok(wallet.eth, 'eth')} ETH` : '';
     log.info(`watching ${health.size} open loans, ${close.filter(([, h]) => h < cfg.hotHealth).length} under ${cfg.hotHealth}× · ${near}${ready ? ` · ${ready} liquidatable` : ''}${w}`);
   }
 
   // what the local page and the Telegram status line show
   function status() {
-    const w = lastView?.wallet;
+    const w = wallet;
     const closest = [...health.entries()].sort((a, b) => a[1] - b[1]).slice(0, 8)
       .map(([b, h]) => ({ borrower: b, health: h < 1 ? Math.floor(h * 1e4) / 1e4 : Math.round(h * 1e4) / 1e4, debt: Number(fmtUsdg(debts.get(b) ?? 0n)) }));   // floored: past the line never shows as 1.0000
+    const bf = backfill && !backfillDone ? { pct: Math.min(99, Math.max(0, Math.floor(((backfill.at - backfill.from + 1) / Math.max(1, backfill.to - backfill.from + 1)) * 100))), error: backfill.error } : null;
+    const st = rpc.stats?.() || null;
     return {
-      started, live: !!cfg.live, liveNow: liveNow(), paused, hasWallet: !!sender, address: me,
-      scan: scan ? { pct: Math.min(99, Math.floor(((scan.at - scan.from) / Math.max(1, scan.to - scan.from)) * 100)), found: scan.found } : null,
-      gas: gasView(lastView?.gasPrice, w?.eth),
+      started, phase, live: !!cfg.live, liveNow: liveNow(), paused, hasWallet: !!sender, address: me,
+      scan: bf, gas: gasView(lastView?.gasPrice, w?.eth ?? null),
       block: lastView?.block?.number ?? null, lastTickAt, lastError, oraclePaused: !!pausedSince,
+      rpc: st ? { host: st.host, ms: st.ms, fallback: st.fallback, error: st.lastError } : null,
       known: known.size, open: health.size, hot: [...health.values()].filter((h) => h < cfg.hotHealth).length, ready: lastReady, closest,
-      wallet: w ? { usdg: Number(fmtUsdg(w.usdg)), wsnet: Number(fmtWs(w.wsnet)), eth: Number(w.eth) / 1e18, allowance: w.allowance == null ? null : Number(fmtUsdg(w.allowance)) } : null,
+      wallet: w ? { ...Object.fromEntries(Object.keys(TOKENS).map((k) => [k, toNum(w[k], k)])), allowance: w.allowance == null ? null : Number(fmtUsdg(w.allowance)), at: walletAt } : null,
     };
   }
-  function setSender(s) { sender = s; me = s?.address ?? null; }
+  function setSender(s) {
+    const changed = (s?.address ?? null) !== me;
+    sender = s; me = s?.address ?? null;
+    if (changed) { wallet = null; walletAt = null; walletLogged = false; loadSeen(); }
+  }
   function setPaused(p) { paused = !!p; }
   // going live (or resuming) acts on a loan at once, not after the dry run's wait on it
   function freshStart() { cooldown.clear(); }
 
-  return { start, tick, keepApproved, status, setSender, setPaused, freshStart, get busy() { return busy; }, get paused() { return paused; }, get known() { return known; }, get health() { return health; }, get params() { return params; } };
+  // the command line's scan and status wait for the whole chain scan
+  const scanDone = async () => { while (!backfillDone) { if (backfillPromise) await backfillPromise.catch(() => null); if (!backfillDone && backfill?.error) throw new Error(backfill.error); } };
+
+  return { start, tick, refreshWallet, scanDone, sendTx, keepApproved, status, setSender, setPaused, freshStart, get busy() { return busy; }, get paused() { return paused; }, get started() { return started; }, get known() { return known; }, get health() { return health; }, get params() { return params; } };
 }
 
 export async function runLoop(bot, cfg, log, { signal } = {}) {

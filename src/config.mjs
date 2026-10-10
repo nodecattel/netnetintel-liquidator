@@ -1,6 +1,6 @@
 // Settings from the environment (README → Settings). Bad values stop the bot at start rather than being guessed.
 import { getAddress } from 'ethers';
-import { DEFAULTS, PUBLIC_RPC } from './constants.mjs';
+import { DEFAULTS, PUBLIC_RPC, PUBLIC_SEQUENCER } from './constants.mjs';
 import { usdgUnits } from './math.mjs';
 
 const num = (v, name, min = 0) => {
@@ -31,7 +31,13 @@ export function configFrom(env) {
     minLogRange: DEFAULTS.minLogRange,
     jsonLogs: flag(env.LOG_JSON, false),
     rpcBatch: num(env.RPC_BATCH, 'RPC_BATCH', 1) ?? 40,      // calls per JSON-RPC batch (the public RPC takes up to about 50)
+    // when your own RPC fails, the public one answers until it is back (RPC_FALLBACK=0 to stop on errors instead)
+    rpcFallback: flag(env.RPC_FALLBACK, true),
+    // signed transactions also go straight to the sequencer, the node that orders them: the shortest path to a block
+    sequencerUrl: /^(off|0|false|no)$/i.test(String(env.SEQUENCER_URL || '')) ? null : (env.SEQUENCER_URL || PUBLIC_SEQUENCER),
+    debug: /^debug$/i.test(String(env.LOG_LEVEL || '')),
   };
+  if (cfg.sequencerUrl && !/^https:\/\/[^\s]+$/.test(cfg.sequencerUrl)) throw new Error('SEQUENCER_URL must be an https:// address, or off');
   cfg.minLogRange = Math.min(cfg.minLogRange, cfg.logRange);
   return cfg;
 }
@@ -44,5 +50,6 @@ export function describe(cfg) {
     `minimum profit at the oracle price: ${(Number(cfg.minProfit) / 1e6).toFixed(2)} USDG`,
     `seized wsNET: ${cfg.payout ? 'sent to ' + cfg.payout : 'kept in the bot wallet'}`,
     `checks: loans under ${cfg.hotHealth}× health every ${cfg.tickSeconds}s, every loan every ${cfg.fullEverySeconds}s`,
+    `RPC: ${cfg.rpcUrl === PUBLIC_RPC ? 'the public Robinhood Chain RPC (rate-limited: your own is faster, see Settings → Speed)' : 'your own' + (cfg.rpcFallback ? ', the public one as fallback' : '')}${cfg.sequencerUrl ? ' · transactions also sent to the sequencer' : ''}`,
   ];
 }

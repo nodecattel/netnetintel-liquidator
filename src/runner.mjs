@@ -2,14 +2,15 @@
 // chose otherwise), the owner's settings, and the Telegram link. server.mjs calls the methods below; nothing here is
 // reachable from outside the owner's machine except the relay's own outbound calls.
 import { readFileSync } from 'node:fs';
-import { JsonRpcProvider, Wallet, getAddress } from 'ethers';
+import { JsonRpcProvider, FetchRequest, Wallet, getAddress, keccak256 } from 'ethers';
 import { randomInt } from 'node:crypto';
-import { CHAIN_ID, USDG, WSNET, EXPLORER_TX } from './constants.mjs';
+import { CHAIN_ID, USDG, WSNET, NET, SNET, EXPLORER_TX, PUBLIC_RPC, PUBLIC_SEQUENCER, PUBLIC_FEED, PUBLIC_FEED_DELAYED, RPC_PROVIDERS, INTEL_API } from './constants.mjs';
 import { configFrom } from './config.mjs';
 import { makeRpc, ERC20 } from './chain.mjs';
 import { loadWallet, keySource, writeKeystore, openKeystore, walletFromSecret } from './wallet.mjs';
 import { makeStore, makeNotify } from './io.mjs';
-import { makeBot } from './bot.mjs';
+import { makeBot, TOKENS, fmtTok, isRevert } from './bot.mjs';
+import { makeIntel, intelBase, walletValue } from './intel.mjs';
 import { makeSettings, effectiveEnv } from './settings.mjs';
 import { makeRelay, TOKEN_RE } from './relay.mjs';
 import { fmtUsdg, fmtWs } from './math.mjs';
@@ -18,13 +19,70 @@ export const VERSION = JSON.parse(readFileSync(new URL('../package.json', import
 const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 export const httpErr = (status, message) => Object.assign(new Error(message), { status });
 
-export function senderOf(wallet, rpcUrl) {
-  const provider = new JsonRpcProvider(rpcUrl, { chainId: CHAIN_ID, name: 'robinhood' }, { staticNetwork: true, batchMaxCount: 1 });
-  const signer = wallet.connect(provider);
+// Signs on this machine; the signed transaction goes to the RPC and, at the same time, straight to the sequencer (the
+// node that orders Robinhood Chain's transactions). Whichever takes it first wins; it is the same transaction, so it
+// can only land once. The sequencer takes nothing but signed transactions, so it never sees the key or the balances.
+// rpcUrl may be a list (your RPC, then the public one): a node that fails to answer (not one that answers "no") is
+// skipped for that call, so sending keeps working while your RPC is down, as reading does.
+// a node that didn't answer, as opposed to the chain answering "no" (a revert is never retried on another node: a node
+// a few blocks behind could say yes to a bid that then reverts on chain). Only the short message is read: ethers puts
+// the calldata in the long one, and hex can contain anything.
+export const isNetErr = (e) => {
+  if (isRevert(e) || e?.code === 'CALL_EXCEPTION' || e?.code === 'INSUFFICIENT_FUNDS' || e?.code === 'NONCE_EXPIRED') return false;
+  if (['NETWORK_ERROR', 'TIMEOUT', 'SERVER_ERROR'].includes(e?.code)) return true;
+  return /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up|timeout|\b(429|502|503|504)\b/i.test(String(e?.shortMessage || e?.code || ''));
+};
+const NODE_TIMEOUT_MS = 12_000, NODE_SKIP_MS = 30_000;
+export function senderOf(wallet, rpcUrl, { sequencerUrl = null, fetchImpl = fetch, log = null } = {}) {
+  const urls = [...new Set((Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl]).filter(Boolean))];
+  const providers = urls.map((u) => { const req = new FetchRequest(u); req.timeout = NODE_TIMEOUT_MS; return new JsonRpcProvider(req, { chainId: CHAIN_ID, name: 'robinhood' }, { staticNetwork: true, batchMaxCount: 1 }); });
+  const signers = providers.map((p) => wallet.connect(p));
+  const down = urls.map(() => 0);                    // a node that failed to answer is tried last for NODE_SKIP_MS
+  const each = async (f) => {
+    const order = [...signers.keys()].sort((a, b) => (down[a] > Date.now()) - (down[b] > Date.now()));
+    let last;
+    for (const [n, i] of order.entries()) {
+      try { return await f(signers[i], providers[i]); }
+      catch (e) {
+        if (!isNetErr(e) || n === order.length - 1) throw e;
+        last = e; down[i] = Date.now() + NODE_SKIP_MS;
+        log?.debug?.(`sender: ${new URL(urls[i]).host} didn't answer (${e.shortMessage || e.code}), trying the next`);
+      }
+    }
+    throw last;
+  };
+  const toSequencer = async (raw) => {
+    const res = await fetchImpl(sequencerUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [raw] }), signal: AbortSignal.timeout(10_000) });
+    const j = await res.json().catch(() => null);
+    if (!res.ok || !j || j.error) throw new Error(`sequencer: ${j?.error?.message || 'HTTP ' + res.status}`);
+    return j.result;
+  };
+  // the receipt from whichever node has it, polled every second for up to two minutes (null if it never shows)
+  const waitFor = async (hash, ms = 120_000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      for (const p of providers) { try { const r = await p.getTransactionReceipt(hash); if (r) return r; } catch { /* the next node */ } }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return null;
+  };
   return {
-    address: wallet.address, provider,
-    estimateGas: (tx) => signer.estimateGas({ ...tx, from: wallet.address }),
-    send: async (tx) => { const r = await signer.sendTransaction({ ...tx, chainId: CHAIN_ID }); return { hash: r.hash, wait: () => r.wait(1, 120_000) }; },
+    address: wallet.address, provider: providers[0],
+    estimateGas: (tx) => each((x) => x.estimateGas({ ...tx, from: wallet.address })),
+    balance: () => each((x, p) => p.getBalance(wallet.address)),
+    feeData: () => each((x, p) => p.getFeeData()),
+    send: async (tx) => {
+      const pop = await each((x) => x.populateTransaction({ ...tx, chainId: CHAIN_ID }));
+      const raw = await signers[0].signTransaction(pop), hash = keccak256(raw);
+      const tries = providers.map((p) => p.broadcastTransaction(raw).then(() => 'rpc'));
+      if (sequencerUrl) tries.push(toSequencer(raw).then(() => 'sequencer'));
+      try {
+        const first = await Promise.any(tries);
+        log?.debug?.(`tx ${hash.slice(0, 10)}… accepted first by the ${first}`);
+      } catch (e) { throw e.errors?.[0] ?? e; }   // all refused: the RPC's reason (nonce, funds) is the clearest
+      for (const t of tries) t.catch(() => null);
+      return { hash, wait: () => waitFor(hash) };
+    },
   };
 }
 
@@ -33,19 +91,32 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
   const settings = makeSettings(dataDir);
   const derived = () => effectiveEnv(env, settings.get());
   const cfg = configFrom(derived().env);
-  const rpc = makeRpc(() => cfg.rpcUrl, { batchSize: cfg.rpcBatch, fetchImpl });
-  const logsRpc = makeRpc(() => cfg.logsRpcUrl, { batchSize: cfg.rpcBatch, fetchImpl });
+  const urls = (u) => () => (cfg.rpcFallback ? [u(), PUBLIC_RPC] : [u()]);
+  const onFallback = (name) => (on, primary, now, why) => {
+    if (on) log.warn(`${name}: ${primary} is not answering${why ? ` (${why})` : ''}: using the public RPC until it is back`);
+    else log.info(`${name}: back on ${now}`);
+  };
+  const rpc = makeRpc(urls(() => cfg.rpcUrl), { batchSize: cfg.rpcBatch, fetchImpl, onFallback: onFallback('RPC') });
+  const logsRpc = makeRpc(urls(() => cfg.logsRpcUrl), { batchSize: cfg.rpcBatch, fetchImpl, onFallback: onFallback('RPC for finding borrowers') });
+  const intel = makeIntel({ base: intelBase(env), version: VERSION, fetchImpl });
   const store = makeStore(dataDir);
   const notify = makeNotify(env, log, fetchImpl);
   const relay = makeRelay({ getToken: () => settings.get().relayToken || null, version: VERSION, fetchImpl, log: (m) => log.warn(m) });
   const events = [];   // the last events, for the local page
-  const onEvent = (ev) => { events.push(ev); if (events.length > 100) events.shift(); relay.report(ev); };
-  const bot = makeBot({ rpc, logsRpc, cfg, store, log, notify, onEvent });
+  const onEvent = (e) => {
+    const ev = { ...e, at: typeof e.at === 'number' ? e.at : Date.now() };   // a liquidation's record carries its ISO time: the event keeps a number
+    events.push(ev); if (events.length > 100) events.shift();
+    if (ev.kind !== 'tx') relay.report(ev);                         // Telegram hears about outcomes; the page lists every transaction
+    if (ev.kind === 'deposit') notify(`Liquidator wallet received ${ev.amount} ${ev.token} (balance ${ev.balance}).`);
+    if (ev.kind === 'outflow') notify(`${ev.amount} ${ev.token} left the liquidator wallet, not sent by the bot. If that wasn't you, move what's left.`);
+  };
+  const bot = makeBot({ rpc, logsRpc, cfg, store, log, notify, onEvent, seed: intel.enabled ? () => intel.loans() : null });
 
   let wallet = null, walletSource = null, pw = null, pending = null, sender = null, withdrawing = false;
   const keyEnv = { ...env, DATA_DIR: dataDir };
   // one sender for the wallet, shared by the loop and withdrawals (a second signer could reuse a nonce)
-  const useWallet = (w, source) => { wallet = w; walletSource = source; sender = w ? makeSender(w, cfg.rpcUrl) : null; bot.setSender(sender); };
+  const newSender = (w) => makeSender(w, cfg.rpcFallback ? [cfg.rpcUrl, PUBLIC_RPC] : cfg.rpcUrl, { sequencerUrl: cfg.sequencerUrl, fetchImpl, log });
+  const useWallet = (w, source) => { wallet = w; walletSource = source; sender = w ? newSender(w) : null; bot.setSender(sender); };
 
   // unlocked at start when the environment gives the key or the password, or the owner chose to stay unlocked
   const fromEnv = ['PRIVATE_KEY', 'PRIVATE_KEY_FILE', 'KEYSTORE_PASSWORD', 'KEYSTORE_PASSWORD_FILE'].some((k) => env[k]);
@@ -63,22 +134,35 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
   function applySettings() {
     const before = cfg.rpcUrl;
     Object.assign(cfg, configFrom(derived().env));
-    if (wallet && cfg.rpcUrl !== before) { sender = makeSender(wallet, cfg.rpcUrl); bot.setSender(sender); }
+    if (wallet && cfg.rpcUrl !== before) { sender = newSender(wallet); bot.setSender(sender); log.info(`RPC changed to ${cfg.rpcUrl}`); }
   }
   const localPaused = () => !!settings.get().paused;
   const syncPause = () => bot.setPaused(localPaused() || relay.paused || withdrawing);
   syncPause();
 
   // ---- the loop: start (retrying while the RPC is down), then tick; the Telegram link rides along ----
+  // NetNet Intel's market context: every minute, in the background (a slow API never holds up a tick)
+  let intelBusy = false, intelAt = 0;
+  const refreshIntel = () => {
+    if (!intel.enabled || intelBusy || Date.now() - intelAt < 60_000) return;
+    intelBusy = true; intelAt = Date.now();
+    intel.refresh(wallet?.address).then((c) => { if (c && !refreshIntel.ok) { refreshIntel.ok = true; log.info(`NetNet Intel: Loop context loaded (${c.loop?.loans ?? '?'} loans, ${c.liquidations?.day?.n ?? '?'} liquidations in 24h)`); } })
+      .catch(() => null).finally(() => { intelBusy = false; });
+  };
+
   async function loop(signal) {
     let wait = 5_000;
+    log.info(`connecting to ${redactRpc(cfg.rpcUrl)}${cfg.rpcUrl === PUBLIC_RPC ? ' (the public RPC)' : ''}${intel.enabled ? ' · loans from NetNet Intel' : ''}`);
     while (!signal?.aborted) {
+      refreshIntel();
+      await bot.refreshWallet().catch((e) => log.debug?.(`wallet read failed: ${e.message}`));   // balances show while it starts
       try { await bot.start(); break; }
       catch (e) { log.warn(`could not start (${e.message}); retrying in ${Math.round(wait / 1000)}s`); await sleep(wait, signal); wait = Math.min(60_000, wait * 2); }
     }
     let errors = 0;
     while (!signal?.aborted) {
       const t0 = Date.now();
+      refreshIntel();
       await relay.poll(statusLine()).catch(() => null);
       syncPause();
       try { await bot.tick(); errors = 0; }
@@ -94,10 +178,17 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     const day = store.history().filter((h) => Date.parse(h.at) > dayAgo);
     return {
       v: VERSION, live: st.live, liveNow: st.liveNow, paused: st.paused, locked: locked(), oraclePaused: st.oraclePaused,
-      usdg: st.wallet?.usdg ?? null, eth: st.wallet?.eth ?? null, wsnet: st.wallet?.wsnet ?? null,
+      usdg: st.wallet?.usdg ?? null, eth: st.wallet?.eth ?? null, wsnet: st.wallet?.wsnet ?? null, net: st.wallet?.net ?? null, snet: st.wallet?.snet ?? null,
       open: st.open, hot: st.hot, ready: st.ready, closest: st.closest[0]?.health ?? null,
       liq24h: day.length, repaid24h: Number(day.reduce((a, h) => a + Number(h.repaid || 0), 0).toFixed(2)), error: st.lastError,
     };
+  }
+
+  // NetNet Intel's view of the market, and what the bot wallet's tokens are worth at its marks
+  function marketView() {
+    const c = intel.context;
+    if (!intel.enabled) return { enabled: false };
+    return { enabled: true, error: intel.lastError, at: c?.at ?? null, loop: c?.loop ?? null, liquidations: c?.liquidations ?? null, value: walletValue(bot.status().wallet, c?.loop) };
   }
 
   // ---- what the page can do ----
@@ -136,11 +227,13 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
           gasFloorEth: Number(cfg.gasFloorWei) / 1e18,
         maxRepayUsdg: cfg.maxRepay == null ? null : Number(fmtUsdg(cfg.maxRepay)), reserveUsdg: Number(fmtUsdg(cfg.reserve)), minProfitUsdg: Number(fmtUsdg(cfg.minProfit)),
           allowPartial: cfg.allowPartial, payoutAddress: cfg.payout, rpcUrl: cfg.rpcUrl === undefined ? null : redactRpc(cfg.rpcUrl), customRpc: !!(saved.RPC_URL || env.RPC_URL),
+          endpoints: { rpc: PUBLIC_RPC, sequencer: PUBLIC_SEQUENCER, feed: PUBLIC_FEED, feedDelayed: PUBLIC_FEED_DELAYED }, providers: RPC_PROVIDERS, sequencer: !!cfg.sequencerUrl, rpcFallback: cfg.rpcFallback, intel: intel.enabled ? INTEL_API.replace(/^https:\/\//, '') : null,
           logsRpc: !!(saved.LOGS_RPC_URL || env.LOGS_RPC_URL), tickSeconds: cfg.tickSeconds, live: cfg.live, paused: localPaused(), stayUnlocked: settings.unlockSaved(), fixed,
         },
         status: bot.status(),
-        telegram: { linked: relay.linked, paused: relay.paused, error: relay.lastError, revoked: relay.revoked },
-        history: store.history().slice(-50).reverse(), events: events.slice(-30).reverse(), log: log.recent ? log.recent(80) : [],
+        market: marketView(),
+        telegram: { linked: relay.linked, paused: relay.paused, error: relay.lastError, revoked: relay.revoked, direct: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) },
+        history: store.history().slice(-50).reverse(), txs: store.txs().slice(-40).reverse(), events: events.filter((e) => e.kind !== 'tx').slice(-30).reverse(), log: log.recent ? log.recent(60) : [],
       };
     },
 
@@ -258,7 +351,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
       if (!wallet) throw httpErr(400, 'the wallet is locked');
       const to = cfg.payout;
       if (!to) throw httpErr(400, 'save your main wallet address (where funds go) first');
-      if (!['usdg', 'wsnet', 'eth', 'all'].includes(what)) throw httpErr(400, 'choose USDG, wsNET, ETH or all');
+      if (!['usdg', 'wsnet', 'net', 'snet', 'eth', 'all'].includes(what)) throw httpErr(400, 'choose USDG, wsNET, NET, sNET, ETH or all');
       if (withdrawing) throw httpErr(409, 'a withdrawal is already running');
       withdrawing = true; syncPause();
       try {
@@ -268,30 +361,34 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     },
   };
   async function doWithdraw(what, to) {
-      const s = sender;
-      const out = {};
-      const bal = async (token) => BigInt(await rpc.one('eth_call', [{ to: token, data: ERC20.encodeFunctionData('balanceOf', [wallet.address]) }, 'latest']));
-      for (const [name, token, fmt] of [['usdg', USDG, fmtUsdg], ['wsnet', WSNET, fmtWs]]) {
-        if (what !== 'all' && what !== name) continue;
-        const amount = await bal(token);
-        if (amount === 0n) continue;
-        const tx = await s.send({ to: token, data: ERC20.encodeFunctionData('transfer', [to, amount]) });
-        await tx.wait(); out[name] = { amount: fmt(amount), tx: tx.hash };
+    const s = sender;
+    const out = {};
+    const bal = async (token) => BigInt(await rpc.one('eth_call', [{ to: token, data: ERC20.encodeFunctionData('balanceOf', [wallet.address]) }, 'latest']));
+    for (const [name, token] of [['usdg', USDG], ['wsnet', WSNET], ['net', NET], ['snet', SNET]]) {
+      if (what !== 'all' && what !== name) continue;
+      const amount = await bal(token);
+      if (amount === 0n) continue;
+      const { hash, receipt } = await bot.sendTx('withdraw', { to: token, data: ERC20.encodeFunctionData('transfer', [to, amount]) }, `${fmtTok(amount, name)} ${TOKENS[name].sym} to your main wallet ${short(to)}`);
+      if (!receipt || receipt.status !== 1) throw httpErr(502, `the ${TOKENS[name].sym} transfer did not confirm (${EXPLORER_TX}${hash})`);
+      out[name] = { amount: fmtTok(amount, name), tx: hash };
+    }
+    if (what === 'eth' || what === 'all') {
+      const balance = await s.balance();
+      const fee = await s.feeData();
+      const per = fee.maxFeePerGas ?? fee.gasPrice ?? 0n;
+      const gas = ((await s.estimateGas({ to, value: 1n })) * 3n) / 2n;   // the chain's own figure (L1 costs, a contract wallet), with room
+      const value = balance - per * gas * 2n;                               // and twice its cost left behind
+      if (value > 0n) {
+        const { hash } = await bot.sendTx('withdraw', { to, value, gasLimit: gas }, `${fmtTok(value, 'eth')} ETH to your main wallet ${short(to)}`);
+        out.eth = { amount: (Number(value) / 1e18).toFixed(6), tx: hash };
       }
-      if (what === 'eth' || what === 'all') {
-        const balance = await s.provider.getBalance(wallet.address);
-        const fee = await s.provider.getFeeData();
-        const per = fee.maxFeePerGas ?? fee.gasPrice ?? 0n;
-        const gas = ((await s.estimateGas({ to, value: 1n })) * 3n) / 2n;   // the chain's own figure (L1 costs, a contract wallet), with room
-        const value = balance - per * gas * 2n;                               // and twice its cost left behind
-        if (value > 0n) { const tx = await s.send({ to, value, gasLimit: gas }); await tx.wait(); out.eth = { amount: (Number(value) / 1e18).toFixed(6), tx: tx.hash }; }
-      }
-      log.info(`withdrawn to ${to}: ${Object.keys(out).join(', ') || 'nothing to send'}`);
-      onEvent({ kind: 'withdraw', to, parts: Object.keys(out) });
-      return { to, ...out };
+    }
+    log.info(`withdrawn to ${to}: ${Object.keys(out).join(', ') || 'nothing to send'}`);
+    onEvent({ kind: 'withdraw', to, parts: Object.keys(out) });
+    return { to, ...out };
   }
 
-  return { api, loop, bot, cfg, relay, statusLine, get wallet() { return wallet; } };
+  return { api, loop, bot, cfg, relay, intel, statusLine, get wallet() { return wallet; } };
 }
 
 function redactRpc(u) {
