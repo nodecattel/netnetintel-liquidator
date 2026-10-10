@@ -14,6 +14,7 @@ const HEADROOM_SEC = 60;
 // Borrowers are scanned up to a few blocks behind the head, so a logs node that is a block or two behind can't make
 // the cursor skip a Borrow it hasn't indexed yet.
 const LOG_LAG = 5;
+const DISCOVER_MS = 15_000, EVERYONE_MS = 10 * 60_000;
 // What gas costs here: a liquidation uses about LIQ_GAS (Morpho's liquidate plus two token transfers; the 30% gas limit
 // margin is never charged), and the wallet's ETH covers this many of them at today's price.
 export const LIQ_GAS = 250_000n;
@@ -58,6 +59,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   // from each tick. At start the scan from `scanned` to the head runs in the background (`backfill`), so the bot
   // watches the loans it already knows (and NetNet Intel's list) from the first second.
   let scanned = store.cursor ?? MARKET_FROM_BLOCK - 1, cursor = scanned, backfill = null, backfillDone = false, backfillRetryAt = 0;
+  let lastDiscover = 0, lastEveryone = 0;
   let rate = null, lastFull = 0, lastHead = null, pausedSince = null, lastSummary = 0, busy = false, ticks = 0;
   let wallet = null, walletAt = null, walletBlock = 0, seen = null, walletLogged = false, backfillPromise = null;
   const own = { pending: 0, open: false, settleBlock: null, until: 0 };
@@ -228,9 +230,16 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     const now = nowMs(), t0 = Date.now();
     ticks++;
     if (!backfillDone && !backfill?.running && now >= backfillRetryAt && backfill) startBackfill(Math.max(scanned, backfill.at) + 1, cursor);
-    await discover(lastHead);
+    // new borrowers: every 15 s, not every tick (a fresh loan sits at the LTV it was opened at, not past the line)
+    if (now - lastDiscover >= DISCOVER_MS) { lastDiscover = now; await discover(lastHead); }
+    // every 30 s: each open loan; every 10 minutes: every wallet that ever borrowed (one may have borrowed again).
+    // Reading all ~800 every 30 s used up providers' per-second limits for nothing: most have no loan now.
     const full = now - lastFull >= cfg.fullEverySeconds * 1000;
-    const list = full ? [...known] : [...known].filter((a) => fresh.has(a) || (health.get(a) ?? Infinity) < cfg.hotHealth);
+    const everyone = now - lastEveryone >= EVERYONE_MS;
+    const list = everyone ? [...known]
+      : full ? [...known].filter((a) => fresh.has(a) || health.has(a))
+      : [...known].filter((a) => fresh.has(a) || (health.get(a) ?? Infinity) < cfg.hotHealth);
+    if (everyone) lastEveryone = now;
     // the rate moves slowly: re-read with every full pass (and until a read succeeds)
     const view = await readTick(rpc, params, me, list, { rate: full || rate == null ? null : rate });
     if (full || rate == null) rate = view.rate;
@@ -260,7 +269,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       health.set(b, v.health); debts.set(b, v.debt);
       if (v.liquidatable) ready.push({ borrower: b, pos, view: v });
     }
-    if (full) for (const b of known) if (!view.positions.has(b)) { health.delete(b); debts.delete(b); }
+    if (everyone) for (const b of known) if (!view.positions.has(b)) { health.delete(b); debts.delete(b); }
     lastReady = ready.length;
     if (ready.length) dbg(`liquidatable: ${ready.map((r) => `${short(r.borrower)} ${(Math.floor(r.view.health * 1e4) / 1e4).toFixed(4)}`).join(', ')}`);
 

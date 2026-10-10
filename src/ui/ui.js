@@ -372,7 +372,9 @@ function dashboard() {
   const notes = [
     S.wallet.locked ? '<div class="note bad">The wallet is locked: log out and in again to unlock it.</div>' : '',
     out ? `<div class="note bad">${esc(amt(out.amount))} ${esc(out.token)} left the bot wallet ${esc(ago(out.at))}, and the bot didn't send it. If that wasn't you, move what's left (Settings → Withdraw).</div>` : '',
-    st.lastError ? `<div class="note bad">The last check failed: ${esc(st.lastError)}. It retries on its own; if it keeps failing, check the RPC in Settings → Speed.</div>` : '',
+    st.lastError ? `<div class="note bad">The last check failed: ${esc(st.lastError)}. ${/rate-limiting/.test(st.lastError)
+      ? (s.customRpc ? 'Your RPC was busy, and the public one it falls back to refused too. It retries on its own; if this keeps showing, your provider plan\'s requests-per-second limit is too low for checks every ' + s.tickSeconds + ' s: raise "Check every" in Settings, or the plan.' : 'The public RPC limits how often each address may call it. Your own RPC (Settings → Speed) avoids this.')
+      : 'It retries on its own; if it keeps failing, check the RPC in Settings → Speed.'}</div>` : '',
     !st.started && !st.lastError ? `<div class="note">${st.phase === 'loading' ? 'Loading the open loans…' : 'Connecting to Robinhood Chain…'}</div>` : '',
     st.scan?.error ? `<div class="note warn">The full chain scan paused (${esc(st.scan.error)}); the bot keeps watching the loans it knows and resumes the scan on its own.</div>` : '',
     st.oraclePaused ? '<div class="note warn">The Loopback oracle is holding liquidations (the pool sits more than 15% under the TWAP). The bot waits and resumes on its own.</div>' : '',

@@ -37,7 +37,8 @@ export function makeRpc(url, { fetchImpl = fetch, batchSize = 40, timeoutMs = 15
     let arr = null;
     try { arr = await res.json(); } catch { arr = null; }
     const rpcShaped = arr && (Array.isArray(arr) || typeof arr === 'object') && (Array.isArray(arr) ? arr.every((x) => x && x.jsonrpc) : !!arr.jsonrpc);
-    if (!rpcShaped || res.status === 429 || res.status >= 500 && !(arr && arr.error)) throw new Error(`HTTP ${res.status} from ${hostOf(u)}`);
+    if (!rpcShaped || res.status === 429 || res.status >= 500 && !(arr && arr.error))
+      throw new Error(res.status === 429 || res.status === 403 ? `${hostOf(u)} is rate-limiting (HTTP ${res.status})` : `HTTP ${res.status} from ${hostOf(u)}`);
     // one object for a batch: a refusal of the whole batch (QuickNode answers a batch it won't run with one error)
     if (!Array.isArray(arr)) arr = body.length === 1 && !arr.error ? [arr] : body.map((b) => ({ jsonrpc: '2.0', id: b.id, ...(body.length === 1 ? arr : { error: arr.error || { message: 'error' } }), }));
     const ms = Date.now() - t0;
