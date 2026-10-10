@@ -12,12 +12,13 @@ export const MARKET = [0xf5fd8bc4efn, 0x0def89a96c5155e3n, 0xc18987993en, 0x0aed
 export const POS = { [BAD]: [0n, 0xaf7e4472bb2an, 0x062c14a2a08dc62en], [GOOD]: [0n, 0xaf7e4472bb2an, 0x062c14a2a08dc62en * 3n] };
 const ERRORS = new Interface(['function Error(string)']);
 
-export function fakeAnswer({ usdg = 1000n * 10n ** 6n, allowance = 0n, priceReverts = false, liquidateReason = null } = {}) {
+export function fakeAnswer({ usdg = 1000n * 10n ** 6n, eth = 10n ** 16n, allowance = 0n, priceReverts = false, liquidateReason = null } = {}) {
   const seen = [];
   const answer = (c) => {
     if (c.method === 'eth_blockNumber') return { result: '0x50b0000' };
     if (c.method === 'eth_getBlockByNumber') return { result: { number: '0x50b0000', timestamp: '0x' + TS.toString(16) } };
-    if (c.method === 'eth_getBalance') return { result: '0x' + (10n ** 16n).toString(16) };
+    if (c.method === 'eth_getBalance') return { result: '0x' + eth.toString(16) };
+    if (c.method === 'eth_gasPrice') return { result: '0x131a230' };
     if (c.method === 'eth_getLogs') return { result: [BAD, GOOD].map((a) => ({ topics: [TOPIC_BORROW, MARKET_ID, '0x' + a.slice(2).toLowerCase().padStart(64, '0'), '0x' + '0'.repeat(64)] })) };
     if (c.method !== 'eth_call') return { error: { message: 'unexpected ' + c.method } };
     const { to, data, from } = c.params[0], sel = data.slice(0, 10), t = to.toLowerCase();

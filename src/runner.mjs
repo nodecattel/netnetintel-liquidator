@@ -133,7 +133,8 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
         wallet: { address: wallet?.address ?? pending?.address ?? null, source: walletSource, locked: locked(), backedUp: walletSource === 'env' || !!saved.backedUp,
           pendingBackup: !!pending, exists: keySource(keyEnv).kind !== 'none' },
         settings: {
-          maxRepayUsdg: cfg.maxRepay == null ? null : Number(fmtUsdg(cfg.maxRepay)), reserveUsdg: Number(fmtUsdg(cfg.reserve)), minProfitUsdg: Number(fmtUsdg(cfg.minProfit)),
+          gasFloorEth: Number(cfg.gasFloorWei) / 1e18,
+        maxRepayUsdg: cfg.maxRepay == null ? null : Number(fmtUsdg(cfg.maxRepay)), reserveUsdg: Number(fmtUsdg(cfg.reserve)), minProfitUsdg: Number(fmtUsdg(cfg.minProfit)),
           allowPartial: cfg.allowPartial, payoutAddress: cfg.payout, rpcUrl: cfg.rpcUrl === undefined ? null : redactRpc(cfg.rpcUrl), customRpc: !!(saved.RPC_URL || env.RPC_URL),
           logsRpc: !!(saved.LOGS_RPC_URL || env.LOGS_RPC_URL), tickSeconds: cfg.tickSeconds, live: cfg.live, paused: localPaused(), stayUnlocked: settings.unlockSaved(), fixed,
         },
@@ -219,13 +220,19 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
         if (!wallet) throw httpErr(400, 'set up and unlock the bot wallet first');
         if (walletSource !== 'env' && !settings.get().backedUp) throw httpErr(400, 'confirm the recovery phrase first');
         if (cfg.maxRepay == null) throw httpErr(400, 'set the most one liquidation may repay first');
+        const w = bot.status().wallet;
+        if (!w) throw httpErr(409, 'the bot hasn\'t read the wallet yet: try again in a few seconds');
+        const floor = Number(cfg.gasFloorWei) / 1e18;
+        if (!(w.eth >= floor)) throw httpErr(400, `the bot wallet needs ETH for gas first: every liquidation pays a little (at least ${floor} ETH; 0.0005 ETH covers about 100)`);
+        if (!(w.usdg > Number(fmtUsdg(cfg.reserve)))) throw httpErr(400, 'the bot wallet needs USDG to liquidate with first' + (cfg.reserve > 0n ? ' (more than the reserve you keep)' : ''));
       }
       settings.set({ LIVE: on ? '1' : '0' }); applySettings();
+      if (on) bot.freshStart();
       log.info(on ? 'LIVE: liquidations will be sent' : 'dry run: nothing will be sent');
       onEvent({ kind: 'mode', live: on });
       return { live: cfg.live };
     },
-    setPaused(p) { settings.set({ paused: !!p }); syncPause(); onEvent({ kind: 'pause', paused: !!p, by: 'page' }); return { paused: bot.paused }; },
+    setPaused(p) { settings.set({ paused: !!p }); syncPause(); if (!p) bot.freshStart(); onEvent({ kind: 'pause', paused: !!p, by: 'page' }); return { paused: bot.paused }; },
     async setStayUnlocked(on, password) {
       if (!(await settings.checkPassword(password))) throw httpErr(401, 'wrong password');
       if (on) settings.saveUnlock(password); else settings.clearUnlock();

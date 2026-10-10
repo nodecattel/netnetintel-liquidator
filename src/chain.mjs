@@ -61,6 +61,7 @@ export async function readTick(rpc, params, me, borrowers, { rate: knownRate = n
     { method: 'eth_getBlockByNumber', params: ['latest', false] },
     call(MORPHO, MORPHO_IFACE.encodeFunctionData('market', [MARKET_ID])),
     call(params.oracle, ORACLE.encodeFunctionData('price', [])),
+    { method: 'eth_gasPrice', params: [] },
   ];
   if (me) calls.push(call(USDG, ERC20.encodeFunctionData('balanceOf', [me])), call(USDG, ERC20.encodeFunctionData('allowance', [me, MORPHO])),
     call(WSNET, ERC20.encodeFunctionData('balanceOf', [me])), { method: 'eth_getBalance', params: [me, 'latest'] });
@@ -73,9 +74,10 @@ export async function readTick(rpc, params, me, borrowers, { rate: knownRate = n
   const market = { totalSupplyAssets: mk[0], totalSupplyShares: mk[1], totalBorrowAssets: mk[2], totalBorrowShares: mk[3], lastUpdate: mk[4], fee: mk[5] };
   // the oracle reverts while its guard holds (pool far under the TWAP): no price, no liquidations
   const price = ok(r[2]) ? BigInt(r[2].result) : null;
+  const gasPrice = r[3]?.result ? BigInt(r[3].result) : null;
   const wallet = me ? {
-    usdg: ok(r[3]) ? BigInt(r[3].result) : 0n, allowance: ok(r[4]) ? BigInt(r[4].result) : null,   // null: unread (never treated as 0)
-    wsnet: ok(r[5]) ? BigInt(r[5].result) : 0n, eth: r[6]?.result ? BigInt(r[6].result) : 0n,
+    usdg: ok(r[4]) ? BigInt(r[4].result) : 0n, allowance: ok(r[5]) ? BigInt(r[5].result) : null,   // null: unread (never treated as 0)
+    wsnet: ok(r[6]) ? BigInt(r[6].result) : 0n, eth: r[7]?.result ? BigInt(r[7].result) : 0n,
   } : null;
   const positions = new Map();
   borrowers.forEach((b, i) => {
@@ -89,7 +91,7 @@ export async function readTick(rpc, params, me, borrowers, { rate: knownRate = n
     const data = IRM.encodeFunctionData('borrowRateView', [paramsTuple(params), [market.totalSupplyAssets, market.totalSupplyShares, market.totalBorrowAssets, market.totalBorrowShares, market.lastUpdate, market.fee]]);
     rate = BigInt(await rpc.one('eth_call', [{ to: params.irm, data }, 'latest']));
   } catch { rate = null; /* unread: the bot re-reads it next tick */ }
-  return { block, market, price, rate, wallet, positions };
+  return { block, market, price, rate, gasPrice, wallet, positions };
 }
 
 /** Borrowers from Borrow events on the market, from `from` to `to`, in ranges that halve when the RPC refuses. */

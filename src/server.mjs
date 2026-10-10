@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import qrcode from 'qrcode-generator';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FILES = { '/': ['ui/index.html', 'text/html'], '/favicon.svg': ['ui/favicon.svg', 'image/svg+xml'], '/ui.js': ['ui/ui.js', 'text/javascript'], '/ui.css': ['ui/ui.css', 'text/css'] };
@@ -99,6 +100,13 @@ export function startServer({ runner, port = 8788, host = '0.0.0.0', allowedHost
       if (req.method === 'GET' && FILES[url.pathname]) {
         const [f, type] = FILES[url.pathname];
         return send(200, readFileSync(join(here, f), 'utf8'), type);
+      }
+      // the bot wallet's address as a QR code, for funding it from a phone wallet (the address only; behind the login)
+      if (req.method === 'GET' && url.pathname === '/qr.svg') {
+        const a = session(req) ? api.state().wallet.address : null;
+        if (!a || !/^0x[0-9a-fA-F]{40}$/.test(a)) return send(404, { error: 'no wallet' });
+        const q = qrcode(0, 'M'); q.addData(a); q.make();
+        return send(200, q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }), 'image/svg+xml');
       }
       const key = `${req.method} ${url.pathname}`;
       const fn = routes[key];

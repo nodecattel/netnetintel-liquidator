@@ -14,6 +14,14 @@ const HEADROOM_SEC = 60;
 // Borrowers are scanned up to a few blocks behind the head, so a logs node that is a block or two behind can't make
 // the cursor skip a Borrow it hasn't indexed yet.
 const LOG_LAG = 5;
+// What gas costs here: a liquidation uses about LIQ_GAS (Morpho's liquidate plus two token transfers; the 30% gas limit
+// margin is never charged), and the wallet's ETH covers this many of them at today's price.
+export const LIQ_GAS = 250_000n;
+export function gasView(gasPrice, eth) {
+  if (!(gasPrice > 0n)) return null;
+  const per = gasPrice * LIQ_GAS;
+  return { gwei: Number(gasPrice) / 1e9, ethPerLiquidation: Number(per) / 1e18, covers: eth == null ? null : Number(eth / per) };
+}
 export const marketIdOf = (p) => keccak256(AbiCoder.defaultAbiCoder().encode(['address', 'address', 'address', 'address', 'uint256'], [p.loanToken, p.collateralToken, p.oracle, p.irm, p.lltv]));
 const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 const LIQ_TOPIC = MORPHO_IFACE.getEvent('Liquidate').topicHash;
@@ -24,7 +32,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   let paused = false;               // the owner's pause (local page or Telegram): keep watching, send nothing
   let params = null;
   const debts = new Map();          // borrower → debt (USDG units) at the last read
-  let lastView = null, lastTickAt = null, lastError = null, lastReady = 0, started = false;
+  let lastView = null, lastTickAt = null, lastError = null, lastReady = 0, started = false, scan = null;
   const emit = (ev) => { try { onEvent({ at: nowMs(), ...ev }); } catch { /* a reporter never stops the loop */ } };
   const liveNow = () => !!(cfg.live && sender && !paused);
   const known = new Set(store.borrowers().map((a) => getAddress(a)));
@@ -48,7 +56,9 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     if (cursor < head) {
       const from = cursor + 1;
       log.info(`finding borrowers: blocks ${from.toLocaleString()} → ${head.toLocaleString()}${known.size ? ` (${known.size} known)` : ' (first run, a minute or two)'}`);
-      const found = await scanBorrowers(logsRpc, from, head, { range: cfg.logRange, minRange: cfg.minLogRange });
+      scan = { from, to: head, at: from, found: known.size };
+      const found = await scanBorrowers(logsRpc, from, head, { range: cfg.logRange, minRange: cfg.minLogRange, onProgress: (b, n) => { scan = { ...scan, at: b, found: n + known.size }; } });
+      scan = null;
       for (const a of found) known.add(a);
       cursor = head; store.setScan(cursor, known);
     }
@@ -93,7 +103,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     if (full) lastFull = now;
     fresh.clear();
     lastHead = view.block?.number ?? lastHead;
-    lastView = { block: view.block, wallet: view.wallet, price: view.price };
+    lastView = { block: view.block, wallet: view.wallet, price: view.price, gasPrice: view.gasPrice };
 
     if (view.price == null) {
       if (!pausedSince) { pausedSince = now; log.warn('the oracle is not giving a price (its guard holds while the pool sits more than 15% under the TWAP): no liquidations until it does'); notify('Loopback oracle paused: no liquidations until it gives a price again.'); emit({ kind: 'oracle', paused: true }); }
@@ -115,7 +125,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     lastReady = ready.length;
 
     const wallet = view.wallet;
-    if (me && wallet && wallet.eth < cfg.gasFloorWei) once('gas', 3_600_000, () => { log.warn(`the wallet has ${(Number(wallet.eth) / 1e18).toFixed(6)} ETH for gas: top it up`); notify(`Liquidator wallet ${short(me)} is low on ETH for gas.`); emit({ kind: 'gas', eth: Number(wallet.eth) / 1e18 }); });
+    if (cfg.live && me && wallet && wallet.eth < cfg.gasFloorWei) once('gas', 3_600_000, () => { log.warn(`the wallet has ${(Number(wallet.eth) / 1e18).toFixed(6)} ETH for gas: top it up`); notify(`Liquidator wallet ${short(me)} is low on ETH for gas.`); emit({ kind: 'gas', eth: Number(wallet.eth) / 1e18 }); });
     summary(now, wallet, ready.length);
     const idle = async () => {
       if (liveNow()) try { await keepApproved(wallet); } catch (e) { once('approve', 600_000, () => log.warn(`could not set the USDG approval: ${e.shortMessage || e.message}`)); }
@@ -134,7 +144,12 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     const results = [];
     for (const t of plans) {
       if ((cooldown.get(t.borrower) ?? 0) > now) continue;
-      if (t.plan.skip) { once(`skip:${t.borrower}`, 600_000, () => log.info(`${short(t.borrower)} is liquidatable (health ${t.view.health.toFixed(4)}, debt ${fmtUsdg(t.view.debt)} USDG) but skipped: ${t.plan.skip}`)); continue; }
+      if (t.plan.skip) {
+        once(`skip:${t.borrower}`, 600_000, () => log.info(`${short(t.borrower)} is liquidatable (health ${t.view.health.toFixed(4)}, debt ${fmtUsdg(t.view.debt)} USDG) but skipped: ${t.plan.skip}`));
+        // a chance missed for want of USDG: worth telling the owner, at most hourly
+        if (liveNow()) once('nofunds', 3_600_000, () => emit({ kind: 'nofunds', borrower: t.borrower, debt: fmtUsdg(t.view.debt), usdg: wallet ? fmtUsdg(wallet.usdg) : null }));
+        continue;
+      }
       if (t.plan.profit < cfg.minProfit) { once(`small:${t.borrower}`, 600_000, () => log.info(`${short(t.borrower)}: a bid earns ${fmtUsdg(t.plan.profit)} USDG at the oracle, under MIN_PROFIT_USDG`)); continue; }
       results.push(await act(t, wallet));
       break;                                            // one liquidation per tick: balances change after it
@@ -236,9 +251,11 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   function status() {
     const w = lastView?.wallet;
     const closest = [...health.entries()].sort((a, b) => a[1] - b[1]).slice(0, 8)
-      .map(([b, h]) => ({ borrower: b, health: Math.floor(h * 1e4) / 1e4, debt: Number(fmtUsdg(debts.get(b) ?? 0n)) }));   // floored: past the line never shows as 1.0000
+      .map(([b, h]) => ({ borrower: b, health: h < 1 ? Math.floor(h * 1e4) / 1e4 : Math.round(h * 1e4) / 1e4, debt: Number(fmtUsdg(debts.get(b) ?? 0n)) }));   // floored: past the line never shows as 1.0000
     return {
       started, live: !!cfg.live, liveNow: liveNow(), paused, hasWallet: !!sender, address: me,
+      scan: scan ? { pct: Math.min(99, Math.floor(((scan.at - scan.from) / Math.max(1, scan.to - scan.from)) * 100)), found: scan.found } : null,
+      gas: gasView(lastView?.gasPrice, w?.eth),
       block: lastView?.block?.number ?? null, lastTickAt, lastError, oraclePaused: !!pausedSince,
       known: known.size, open: health.size, hot: [...health.values()].filter((h) => h < cfg.hotHealth).length, ready: lastReady, closest,
       wallet: w ? { usdg: Number(fmtUsdg(w.usdg)), wsnet: Number(fmtWs(w.wsnet)), eth: Number(w.eth) / 1e18, allowance: w.allowance == null ? null : Number(fmtUsdg(w.allowance)) } : null,
@@ -246,8 +263,10 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   }
   function setSender(s) { sender = s; me = s?.address ?? null; }
   function setPaused(p) { paused = !!p; }
+  // going live (or resuming) acts on a loan at once, not after the dry run's wait on it
+  function freshStart() { cooldown.clear(); }
 
-  return { start, tick, keepApproved, status, setSender, setPaused, get busy() { return busy; }, get paused() { return paused; }, get known() { return known; }, get health() { return health; }, get params() { return params; } };
+  return { start, tick, keepApproved, status, setSender, setPaused, freshStart, get busy() { return busy; }, get paused() { return paused; }, get known() { return known; }, get health() { return health; }, get params() { return params; } };
 }
 
 export async function runLoop(bot, cfg, log, { signal } = {}) {

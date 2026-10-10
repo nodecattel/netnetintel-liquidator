@@ -28,7 +28,17 @@ Check: `docker info` (it must print server details, not an error).
 
 ## 2. Start the liquidator
 
-Run exactly this, as one line:
+Mac or Linux, the easiest: the starter checks Docker (and opens Docker Desktop on a Mac), pulls the image, starts the
+container on `127.0.0.1` only, waits for the page and opens it. Running it again updates the bot and keeps its data:
+
+```
+curl -fsSL https://raw.githubusercontent.com/nodecattel/netnetintel-liquidator/main/starter/start.sh | sh
+```
+
+Windows: the user downloads https://github.com/nodecattel/netnetintel-liquidator/raw/main/starter/start.bat and
+double-clicks it (Docker Desktop running first).
+
+Or the container directly, exactly this, as one line:
 
 ```
 docker run -d --name netnet-liq --restart unless-stopped -p 127.0.0.1:8788:8788 -v netnet-liq:/data ghcr.io/nodecattel/netnetintel-liquidator:latest
@@ -50,7 +60,11 @@ Open http://localhost:8788 (Mac: `open http://localhost:8788`; Windows: `start h
 
 1. **Choose a password.** It protects the page and encrypts the bot's key. There is no reset: a password manager is a good home for it.
 2. **Make the bot's wallet** and write the 12 words on paper; the page checks three of them before saving. (Or import a wallet made just for the bot.)
-3. **Fund it** on Robinhood Chain: USDG to liquidate with, and about 0.001 ETH for gas.
+3. **Fund it** on Robinhood Chain, both: **ETH for gas** (every transaction pays a little; 0.0005 ETH covers about
+   100 liquidations) and **USDG** to liquidate with. The page shows the address as text and a QR code, live balances,
+   and how many liquidations the ETH covers. Already on Robinhood Chain (e.g. Robinhood Wallet): send both to the
+   bot's address. From another chain: a bridge with the bot's address as recipient (Across turns USDC into USDG; Relay;
+   Jumper). The user sends the funds; you don't. Going live waits until both are there.
 4. **Set limits:** the most one liquidation may repay, a reserve, the minimum profit, and their main wallet (seized wsNET and withdrawals go only there).
 5. **Link Telegram (optional):** in @netnetintel_bot send `/liquidator`, tap *Make a pairing code*, paste it on the page. Telegram can then show its liquidations and pause or resume it; it can't change limits or move funds.
 6. **Watch in dry run**, then press *Go live* and type LIVE.
@@ -63,7 +77,7 @@ After a restart the wallet stays locked until they log in on the page (Telegram 
 |---|---|
 | Is it running? | `docker ps --filter name=netnet-liq` |
 | Recent log | `docker logs --tail 50 netnet-liq` |
-| Update | `docker pull ghcr.io/nodecattel/netnetintel-liquidator:latest && docker rm -f netnet-liq`, then the `docker run` line again. The volume keeps the wallet and settings. |
+| Update | Run the starter again, or `docker pull ghcr.io/nodecattel/netnetintel-liquidator:latest && docker rm -f netnet-liq` then the `docker run` line again. The volume keeps the wallet and settings. |
 | Stop completely | `docker stop netnet-liq` (again: `docker start netnet-liq`) |
 
 **Removing the wallet for good** is `docker volume rm netnet-liq`. Only after the user has withdrawn everything on the page and confirms they still have the 12 words. Ask first; it can't be undone.
@@ -73,6 +87,7 @@ After a restart the wallet stays locked until they log in on the page (Telegram 
 - Page doesn't open: is the container running? Use `http://localhost:8788` (not https), on the same computer or through the SSH tunnel.
 - "Open this page at http://localhost:8788": the page only answers on localhost.
 - Forgot the page password: it also encrypts the key, so it can't be reset. The user restores the wallet from the 12 words: stop the container, start a new one with a new volume name, and import the words on its page. Don't delete the old volume until the funds are confirmed in the new wallet.
+- "Needs ETH for gas" when going live: the bot wallet has no ETH on Robinhood Chain. A little ETH must be sent there (not on Ethereum or another chain).
 - "RPC problem" on the page: the public Robinhood Chain RPC is busy. The user can add their own RPC in Settings.
 - Telegram link lost: make a new code with /liquidator and paste it in Settings → Telegram.
 

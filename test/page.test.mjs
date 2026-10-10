@@ -62,6 +62,8 @@ test('first visit → password → new wallet (saved only after the 3-word check
     const s = (await p.call('/api/settings', { maxRepayUsdg: 250, reserveUsdg: 5, minProfitUsdg: 0.5, allowPartial: false })).body;
     assert.equal(s.maxRepayUsdg, 250); assert.equal(s.allowPartial, false);
     assert.equal((await p.call('/api/live', { on: true, confirm: 'live?' })).status, 400);
+    assert.match((await p.call('/api/live', { on: true, confirm: 'LIVE' })).body.error, /hasn't read the wallet yet/);
+    await p.runner.bot.start(); await p.runner.bot.tick();
     assert.equal((await p.call('/api/live', { on: true, confirm: 'LIVE' })).body.live, true);
     assert.equal(p.runner.cfg.live, true);
     assert.equal(p.runner.cfg.maxRepay, 250_000_000n);
@@ -152,8 +154,8 @@ test('the loop through the runner: live and unlocked, it liquidates the loan pas
     await p.call('/api/password', { password: PW });
     await p.call('/api/wallet/import', { secret: '0x' + '33'.repeat(32) });
     await p.call('/api/settings', { maxRepayUsdg: 500 });
-    await p.call('/api/live', { on: true, confirm: 'LIVE' });
-    await p.runner.bot.start();
+    await p.runner.bot.start(); await p.runner.bot.tick();
+    assert.equal((await p.call('/api/live', { on: true, confirm: 'LIVE' })).body.live, true);
     const r = await p.runner.bot.tick();
     assert.equal(r.results[0].sent, true);
     const s = p.senders.at(-1);
@@ -189,4 +191,31 @@ test('review fixes: parallel password guesses are capped; LIVE from the environm
     assert.equal(r.status, 409); assert.match(r.body.error, /environment/);
     assert.equal(q.runner.cfg.live, true);
   } finally { q.close(); }
+});
+
+test('going live needs ETH for gas and USDG; the page says which, and how much gas the ETH covers', async () => {
+  for (const [fetch, re] of [[{ eth: 0n }, /needs ETH for gas/], [{ usdg: 0n }, /needs USDG/]]) {
+    const p = await boot({ fetch });
+    try {
+      await p.call('/api/password', { password: PW });
+      await p.call('/api/wallet/import', { secret: '0x' + '44'.repeat(32) });
+      await p.call('/api/settings', { maxRepayUsdg: 100 });
+      await p.runner.bot.start(); await p.runner.bot.tick();
+      const r = await p.call('/api/live', { on: true, confirm: 'LIVE' });
+      assert.equal(r.status, 400); assert.match(r.body.error, re);
+      assert.equal(p.runner.cfg.live, false);
+    } finally { p.close(); }
+  }
+  const p = await boot();
+  try {
+    await p.call('/api/password', { password: PW });
+    await p.call('/api/wallet/import', { secret: '0x' + '55'.repeat(32) });
+    await p.runner.bot.start(); await p.runner.bot.tick();
+    const g = (await p.call('/api/state')).body.status.gas;
+    // 0.02 gwei × 250k gas = 0.000005 ETH a liquidation; the fake wallet's 0.01 ETH covers 2,000
+    assert.ok(Math.abs(g.ethPerLiquidation - 0.0000050075) < 1e-9, String(g.ethPerLiquidation));
+    assert.equal(g.covers, 1997);
+    const qr = await fetch(p.base + '/qr.svg', { headers: { cookie: '' } });
+    assert.equal(qr.status, 404, 'the QR is behind the login');
+  } finally { p.close(); }
 });

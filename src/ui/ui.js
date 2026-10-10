@@ -43,17 +43,40 @@ function render() {
   if (view === 'settings') return settingsScreen();
   const w = S.wallet, st = S.settings;
   if (!w.exists || w.pendingBackup || phrase) return walletStep();
-  if (view === 'auto' && !store.get('liq-funded') && !S.status.wallet?.usdg) return fundStep();
+  if (view === 'fund' || (view === 'auto' && !store.get('liq-funded') && !funded())) return fundStep();
   if (st.maxRepayUsdg == null) return limitsStep(true);
   if (!S.telegram.linked && !store.get('liq-skip-tg')) return telegramStep(true);
   return dashboard();
 }
+// ---- what the bot needs before it can liquidate ----
+const REC_ETH = 0.0005;   // about 100 liquidations at Robinhood Chain's usual gas price
+const BRIDGES = [
+  ['Across', 'https://across.to/robinhood-bridge', 'USDC from 13 chains arrives as USDG; ETH too'],
+  ['Relay', 'https://relay.link/bridge/robinhood', 'ETH and USDG from most chains, in seconds'],
+  ['Jumper', 'https://jumper.xyz/', 'compares bridges across 50+ chains'],
+];
+function needs() {
+  const b = S.status.wallet, floor = S.settings.gasFloorEth || 0.00005;
+  return {
+    eth: b ? b.eth >= floor : null, ethLow: b ? b.eth < REC_ETH : null,
+    usdg: b ? b.usdg > (S.settings.reserveUsdg || 0) : null,
+    limit: S.settings.maxRepayUsdg != null,
+  };
+}
+const funded = () => { const n = needs(); return n.eth && n.usdg; };
+const mark = (ok) => (ok == null ? '<b>…</b>' : ok ? '<b>✓</b>' : '<b>○</b>');
+function coversText(g, eth) {
+  if (!g || !(eth > 0)) return '';
+  return g.covers >= 1000 ? 'enough for 1,000+ liquidations' : `enough for about ${g.covers.toLocaleString('en-US')} liquidation${g.covers === 1 ? '' : 's'}`;
+}
+function scanText(st) { return st.scan ? `Finding every borrower since the market opened: ${st.scan.pct}% (${st.scan.found} so far)` : ''; }
+
 function footer() {
   const st = S.status, fd = $('fdot'), fs = $('fstatus');
   $('fver').textContent = S.version ? 'v' + S.version : '';
   const bad = st.lastError, warn = st.paused || st.oraclePaused || S.wallet.locked;
   fd.className = 'dot ' + (bad ? 'bad' : warn ? 'warn' : st.block ? 'ok' : '');
-  fs.textContent = bad ? 'RPC problem' : S.wallet.locked ? 'Locked' : st.block ? 'Block ' + Number(st.block).toLocaleString('en-US') : st.started ? 'Starting' : 'Finding borrowers';
+  fs.textContent = bad ? 'RPC problem' : S.wallet.locked ? 'Locked' : st.block ? 'Block ' + Number(st.block).toLocaleString('en-US') : st.scan ? `Finding borrowers ${st.scan.pct}%` : st.started ? 'Starting' : 'Connecting';
 }
 function pills() {
   const st = S.status, s = S.settings;
@@ -137,20 +160,39 @@ function phraseScreen() {
 
 // ---- 2. fund ----
 function fundStep() {
-  const w = S.wallet, b = S.status.wallet;
-  $app.innerHTML = `${head('Fund the bot', 'On Robinhood Chain. The bot repays loans with USDG and pays gas in ETH.')}${steps(2)}
-    ${flash ? `<div class="note ok">${esc(flash)}</div>` : ''}
-    <div class="card"><h2>Bot wallet</h2>
-      <div class="addr"><code>${esc(w.address)}</code><button class="copy" id="cp">Copy</button><a class="small" href="${EXPLORER}/address/${esc(w.address)}" target="_blank" rel="noopener">Explorer ↗</a></div>
-      <ul><li><b>USDG</b>: what it may liquidate with. Loans range from a few USDG to a few hundred; with less, it liquidates part of a loan.</li>
-      <li><b>A little ETH</b> for gas: about 0.001 ETH covers hundreds of liquidations.</li></ul>
-      <div class="kv"><div><span>USDG</span><b>${n2(b?.usdg)}</b></div><div><span>ETH</span><b>${b ? b.eth.toFixed(5) : '—'}</b></div></div>
-      <p class="hint">Balances refresh every few seconds. You can also continue unfunded and watch in dry run.</p>
-      <div class="row"><button class="primary" id="go">Continue</button></div></div>`;
+  const w = S.wallet, b = S.status.wallet, g = S.status.gas, n = needs(), floor = S.settings.gasFloorEth || 0.00005;
+  const was = fundStep.last || {};
+  const arrived = b && ((was.eth != null && b.eth > was.eth) || (was.usdg != null && b.usdg > was.usdg));
+  fundStep.last = b ? { eth: b.eth, usdg: b.usdg } : {};
+  if (view === 'fund') setTimeout(() => { if ($('go')) $('go').textContent = 'Back to the dashboard'; }, 0);
+  $app.innerHTML = `${head('Fund the bot', 'Two things, on Robinhood Chain: USDG to liquidate with, and a little ETH to pay gas.')}${steps(2)}
+    ${flash ? `<div class="note ok">${esc(flash)}</div>` : arrived ? '<div class="note ok">Received: balances updated.</div>' : ''}
+    <div class="grid">
+      <div class="card"><h2>Send to the bot wallet</h2>
+        <div class="fundaddr"><img class="qr" src="/qr.svg?a=${esc(w.address)}" alt="QR code of the bot wallet's address" width="132" height="132">
+          <div><div class="addr"><code>${esc(w.address)}</code></div>
+          <div class="row mt6"><button class="copy" id="cp">Copy address</button><a class="small" href="${EXPLORER}/address/${esc(w.address)}" target="_blank" rel="noopener">Explorer ↗</a></div>
+          <p class="hint">On <b>Robinhood Chain</b> only (chain id 4663). Sent on another network, it won't arrive here.</p></div></div>
+      </div>
+      <div class="card"><h2>What it needs</h2>
+        <div class="need ${n.eth ? 'ok' : ''}">${mark(n.eth)}<div><b>ETH for gas</b> · ${b ? b.eth.toFixed(5) : '—'} ETH
+          <p class="hint">Every transaction pays gas in ETH: the one-time USDG approval and each liquidation. ${REC_ETH} ETH is plenty to start${g ? ` (${g.ethPerLiquidation.toFixed(7)} ETH a liquidation at today's gas)` : ''}${b && b.eth > 0 ? `: what it holds is ${coversText(g, b.eth)}` : ''}.${n.eth && n.ethLow ? ' Topping up to ' + REC_ETH + ' ETH is a good idea.' : ''}</p></div></div>
+        <div class="need ${n.usdg ? 'ok' : ''}">${mark(n.usdg)}<div><b>USDG to liquidate with</b> · ${n2(b?.usdg)} USDG
+          <p class="hint">It repays loans with this and gets back about 12.7% more in wsNET. Recent loans range from a few USDG to a few hundred; with less, it liquidates part of a loan.</p></div></div>
+        <p class="hint">${b ? 'Balances refresh every few seconds.' : 'Reading the balances…'}</p>
+      </div>
+    </div>
+    <div class="card"><h2>Getting ETH and USDG onto Robinhood Chain</h2>
+      <p><b>Already on Robinhood Chain</b> (Robinhood Wallet, or another wallet there)? Send both to the address above.</p>
+      <p><b>From another chain</b>, use a bridge and set the recipient to the bot's address (or bridge to your own wallet first, then send):</p>
+      <div class="bridges">${BRIDGES.map(([name, url, what]) => `<a class="bridge" href="${url}" target="_blank" rel="noopener"><b>${name} ↗</b><span>${what}</span></a>`).join('')}</div>
+      <p class="hint">Bridges are third-party services; check the destination chain is Robinhood Chain before you confirm.</p>
+    </div>
+    <div class="row">${funded() ? '<button class="primary" id="go">Continue</button>' : `<button class="primary" id="go">Continue in dry run</button><span class="hint">You can fund it later: it watches and simulates without funds${n.eth === false ? ', and going live waits for ETH' : ''}${n.usdg === false ? ' and USDG' : ''}.</span>`}</div>`;
   flash = '';
   copyBtn('cp', w.address);
   $('go').onclick = () => { store.set('liq-funded', '1'); view = 'auto'; render(); };
-  timer = setTimeout(() => load().catch(() => null), 6000);
+  timer = setTimeout(() => load().catch(() => null), 5000);
 }
 
 // ---- 3. limits (and the settings screen) ----
@@ -218,14 +260,16 @@ function telegramStep() {
 
 // ---- dashboard ----
 function dashboard() {
-  const st = S.status, s = S.settings, w = S.status.wallet, t = S.telegram;
-  const lowGas = w && w.eth < 0.00005, noUsdg = w && w.usdg <= 0.01;
+  const st = S.status, s = S.settings, w = S.status.wallet, t = S.telegram, n = needs();
+  const lowGas = w && n.eth === false, noUsdg = w && n.usdg === false;
+  const missing = [n.eth === false && 'ETH for gas', n.usdg === false && 'USDG', !n.limit && 'a spending limit'].filter(Boolean);
   const notes = [
     S.wallet.locked ? '<div class="note bad">The wallet is locked: log out and in again to unlock it.</div>' : '',
     st.lastError ? `<div class="note bad">The last check failed: ${esc(st.lastError)}. Check the RPC in Settings.</div>` : '',
     st.oraclePaused ? '<div class="note warn">The Loopback oracle is holding liquidations (the pool sits more than 15% under the TWAP). The bot waits and resumes on its own.</div>' : '',
-    lowGas ? '<div class="note warn">Low on ETH for gas: send the bot wallet a little ETH.</div>' : '',
-    s.live && noUsdg ? '<div class="note warn">Live, but the wallet has no USDG to liquidate with.</div>' : '',
+    s.live && lowGas ? '<div class="note bad">Live, but out of ETH for gas: it can\'t send anything until you top it up. <a href="#" id="tofund">How to fund it</a></div>' : '',
+    s.live && noUsdg ? '<div class="note warn">Live, but the wallet has no USDG to liquidate with. <a href="#" id="tofund2">How to fund it</a></div>' : '',
+    st.scan ? `<div class="note">${esc(scanText(st))}…</div>` : '',
     t.paused ? '<div class="note warn">Paused from Telegram: resume it from /liquidator.</div>' : '',
     flash ? `<div class="note ok">${esc(flash)}</div>` : '',
   ].join('');
@@ -242,9 +286,20 @@ function dashboard() {
         <div class="addr"><code>${esc(short(S.wallet.address))}</code><button class="copy" id="cp">Copy</button><a class="small" href="${EXPLORER}/address/${esc(S.wallet.address || '')}" target="_blank" rel="noopener">Explorer ↗</a></div>
         <div class="kv"><div><span>USDG</span><b>${n2(w?.usdg)}</b></div><div><span>wsNET</span><b>${n4(w?.wsnet)}</b></div><div><span>ETH</span><b>${w ? w.eth.toFixed(5) : '—'}</b></div></div></div>
     </div>
+    ${s.live ? '' : `<div class="card"><h2>Ready to go live?</h2>
+      <div class="checks">
+        <div class="need ok"><b>✓</b><div>Bot wallet saved</div></div>
+        <div class="need ${n.eth ? 'ok' : ''}">${mark(n.eth)}<div>ETH for gas · ${w ? w.eth.toFixed(5) : '—'} ETH${w && w.eth > 0 ? ` <span class="muted">(${esc(coversText(st.gas, w.eth))})</span>` : ''}</div></div>
+        <div class="need ${n.usdg ? 'ok' : ''}">${mark(n.usdg)}<div>USDG to liquidate with · ${n2(w?.usdg)}</div></div>
+        <div class="need ${n.limit ? 'ok' : ''}">${mark(n.limit)}<div>Spending limit · ${s.maxRepayUsdg != null ? 'up to ' + n2(s.maxRepayUsdg) + ' USDG a liquidation' : 'not set'}</div></div>
+        <div class="need ${s.payoutAddress ? 'ok' : 'opt'}">${s.payoutAddress ? '<b>✓</b>' : '<b>–</b>'}<div>Your main wallet <span class="muted">(optional: seized wsNET goes there)</span></div></div>
+        <div class="need ${t.linked ? 'ok' : 'opt'}">${t.linked ? '<b>✓</b>' : '<b>–</b>'}<div>Telegram <span class="muted">(optional: reports and pause from your phone)</span></div></div>
+      </div>
+      ${missing.length ? `<p class="hint">Before going live: ${esc(missing.join(', '))}. ${n.eth === false || n.usdg === false ? '<a href="#" id="tofund3">Fund the bot</a>' : ''}</p>` : '<p class="hint">All set. Watch the dry run for a while, then go live.</p>'}
+    </div>`}
     <div class="card"><h2>Controls</h2>
       <div class="row mt0">
-        ${s.live ? '<button id="dry">Back to dry run</button>' : '<button class="primary" id="live">Go live…</button>'}
+        ${s.live ? '<button id="dry">Back to dry run</button>' : `<button class="primary" id="live" ${missing.length ? 'disabled' : ''}>Go live…</button>`}
         ${st.paused && !t.paused ? '<button id="resume">Resume</button>' : !st.paused ? '<button id="pause">Pause</button>' : ''}
         <button id="settings">Settings</button><button id="logout">Log out</button>
       </div>
@@ -257,6 +312,7 @@ function dashboard() {
       ${S.history.map((h) => `<tr><td>${esc(when(h.at))}</td><td><code>${esc(short(h.borrower))}</code></td><td class="num">${esc(h.repaid)}</td><td class="num">${esc(h.seized)}</td><td class="num pos">+${esc(h.profitAtOracle)}</td><td><a href="${EXPLORER}/tx/${esc(h.tx)}" target="_blank" rel="noopener">tx ↗</a></td></tr>`).join('')}</tbody></table></div><p class="hint">* At the oracle price, in USDG.</p>` : '<p class="muted">None yet.</p>'}</div>
     <div class="card"><h2>Activity</h2><div class="log">${(S.log || []).slice().reverse().map((l) => `<div class="${esc(l.level)}">${esc(new Date(l.t).toLocaleTimeString())} ${esc(l.msg)}</div>`).join('') || 'Nothing yet.'}</div></div>`;
   copyBtn('cp', S.wallet.address || '');
+  for (const id of ['tofund', 'tofund2', 'tofund3']) if ($(id)) $(id).onclick = (e) => { e.preventDefault(); view = 'fund'; render(); };
   const act = async (path, body) => { try { await api(path, body); await load(); } catch (e) { err('e', e); } };
   if ($('pause')) $('pause').onclick = () => act('/api/pause', { paused: true });
   if ($('resume')) $('resume').onclick = () => act('/api/pause', { paused: false });

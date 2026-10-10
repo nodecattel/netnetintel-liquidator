@@ -23,6 +23,7 @@ function fakeChain({ usdg = 1000n * 10n ** 6n, allowance = 0n, priceReverts = fa
     if (c.method === 'eth_blockNumber') return { result: '0x50b0000' };
     if (c.method === 'eth_getBlockByNumber') return { result: { number: '0x50b0000', timestamp: '0x' + TS.toString(16) } };
     if (c.method === 'eth_getBalance') return { result: '0x' + (10n ** 16n).toString(16) };
+    if (c.method === 'eth_gasPrice') return { result: '0x131a230' };
     if (c.method === 'eth_getLogs') return { result: [BAD, GOOD].map((a) => ({ topics: [TOPIC_BORROW, MARKET_ID, '0x' + a.slice(2).toLowerCase().padStart(64, '0'), '0x' + '0'.repeat(64)] })) };
     if (c.method !== 'eth_call') return { error: { message: 'unexpected ' + c.method } };
     const { to, data, from } = c.params[0], sel = data.slice(0, 10), t = to.toLowerCase();

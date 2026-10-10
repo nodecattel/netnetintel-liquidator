@@ -18,19 +18,33 @@ steps to you.
 
 ## Quick start
 
-You need Docker (Docker Desktop on Mac or Windows).
+You need Docker (Docker Desktop on Mac or Windows) and, on Robinhood Chain, **USDG** to liquidate with plus **a
+little ETH for gas** (0.0005 ETH covers about 100 liquidations).
+
+**Mac or Linux:** paste this into Terminal. It starts (or updates) the bot and opens its page:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nodecattel/netnetintel-liquidator/main/starter/start.sh | sh
+```
+
+**Windows:** download [`starter/start.bat`](starter/start.bat) and double-click it.
+
+**Or with Docker directly:**
 
 ```sh
 docker run -d --name netnet-liq --restart unless-stopped -p 127.0.0.1:8788:8788 \
   -v netnet-liq:/data ghcr.io/nodecattel/netnetintel-liquidator
 ```
 
-Open **http://localhost:8788** and follow the page:
+Then open **http://localhost:8788** and follow the page:
 
 1. **Password.** It protects the page and encrypts the bot's key. There is no reset, so keep it in a password manager.
 2. **Wallet.** Make a new one (write the 12 words on paper; the page checks three before saving it), or import a
    wallet made just for the bot.
-3. **Fund.** Send it USDG to liquidate with and about 0.001 ETH for gas, on Robinhood Chain.
+3. **Fund.** On Robinhood Chain, send the bot's address (the page shows it with a QR code) **ETH for gas** (every
+   transaction pays a little: the one-time USDG approval and each liquidation) and **USDG** to liquidate with. Coming
+   from another chain? The page links bridges: Across (USDC arrives as USDG), Relay and Jumper. The page shows how many
+   liquidations the ETH covers, and won't go live without both.
 4. **Limits.** The most one liquidation may repay, a reserve, the minimum profit, and your main wallet (seized wsNET
    and withdrawals go only there).
 5. **Telegram** (optional). In @netnetintel_bot send `/liquidator`, tap *Make a pairing code*, paste it on the page.
@@ -69,14 +83,15 @@ seized amounts equal the Liquidate event's.
   What it is worth later depends on NET's price.
 - **Competition.** Other liquidators watch the same market. Your own RPC (Settings → Speed) helps. A miss costs
   nothing: the simulation catches it before sending.
-- **Gas.** Robinhood Chain gas is cheap, but the wallet needs some ETH. The bot warns below 0.00005 ETH.
+- **Gas.** Paid in ETH. A liquidation costs about 0.000005 ETH at Robinhood Chain's usual 0.02 gwei, so 0.0005 ETH lasts
+  about 100. The page shows how many your ETH covers; Telegram warns when it runs low.
 
 ## Everyday commands
 
 | Task | Command |
 |---|---|
 | Recent log | `docker logs --tail 50 netnet-liq` |
-| Update | `docker pull ghcr.io/nodecattel/netnetintel-liquidator && docker rm -f netnet-liq`, then the `docker run` line again (the volume keeps everything) |
+| Update | Run the starter again (or `docker pull …` then the `docker run` line again). The volume keeps everything |
 | Stop / start | `docker stop netnet-liq` / `docker start netnet-liq` |
 
 The page does everything else. For headless setups there are still commands (`scan`, `status`, `new-wallet`,
