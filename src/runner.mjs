@@ -150,14 +150,29 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
       .catch(() => null).finally(() => { intelBusy = false; });
   };
 
+  // Nothing fails silently: two minutes of failed checks (or of failing to start) is told to Telegram once, and so is
+  // the recovery. A bot that stops altogether is noticed on the other side (no check-in for 15 minutes).
+  const STALL_MS = 120_000;
+  let failingSince = null, stallTold = false;
+  const failed = (e) => {
+    failingSince ??= Date.now();
+    if (!stallTold && Date.now() - failingSince >= STALL_MS) { stallTold = true; onEvent({ kind: 'stalled', error: String(e?.message || e).slice(0, 160), sinceMin: Math.round((Date.now() - failingSince) / 60e3) }); }
+  };
+  const worked = () => { if (stallTold) onEvent({ kind: 'running', downMin: Math.round((Date.now() - failingSince) / 60e3) }); failingSince = null; stallTold = false; };
+
   async function loop(signal) {
     let wait = 5_000;
     log.info(`connecting to ${redactRpc(cfg.rpcUrl)}${cfg.rpcUrl === PUBLIC_RPC ? ' (the public RPC)' : ''}${intel.enabled ? ' · loans from NetNet Intel' : ''}`);
+    onEvent({ kind: 'started', v: VERSION, live: cfg.live, locked: locked() });   // a restart (reboot, update, crash) is never silent
     while (!signal?.aborted) {
       refreshIntel();
       await bot.refreshWallet().catch((e) => log.debug?.(`wallet read failed: ${e.message}`));   // balances show while it starts
-      try { await bot.start(); break; }
-      catch (e) { log.warn(`could not start (${e.message}); retrying in ${Math.round(wait / 1000)}s`); await sleep(wait, signal); wait = Math.min(60_000, wait * 2); }
+      try { await bot.start(); worked(); break; }
+      catch (e) {
+        log.warn(`could not start (${e.message}); retrying in ${Math.round(wait / 1000)}s`); failed(e);
+        await relay.poll(statusLine()).catch(() => null); await relay.flush().catch(() => null);   // Telegram hears it while it retries
+        await sleep(wait, signal); wait = Math.min(60_000, wait * 2);
+      }
     }
     let errors = 0;
     while (!signal?.aborted) {
@@ -165,8 +180,8 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
       refreshIntel();
       await relay.poll(statusLine()).catch(() => null);
       syncPause();
-      try { await bot.tick(); errors = 0; }
-      catch (e) { errors++; if (errors === 1 || errors % 30 === 0) log.warn(`tick failed (${errors} in a row): ${e.message}`); }
+      try { await bot.tick(); errors = 0; worked(); }
+      catch (e) { errors++; failed(e); if (errors === 1 || errors % 30 === 0) log.warn(`tick failed (${errors} in a row): ${e.message}`); }
       await relay.flush().catch(() => null);
       await sleep(Math.max(200, cfg.tickSeconds * 1000 * (errors > 3 ? 3 : 1) - (Date.now() - t0)), signal);
     }

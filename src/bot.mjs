@@ -267,7 +267,10 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     if (cfg.live && me && wallet?.eth != null && wallet.eth < cfg.gasFloorWei) once('gas', 3_600_000, () => { log.warn(`the wallet has ${(Number(wallet.eth) / 1e18).toFixed(6)} ETH for gas: top it up`); notify(`Liquidator wallet ${short(me)} is low on ETH for gas.`); emit({ kind: 'gas', eth: Number(wallet.eth) / 1e18 }); });
     summary(now, wallet, ready.length);
     const idle = async () => {
-      if (liveNow()) try { await keepApproved(spend); } catch (e) { once('approve', 600_000, () => log.warn(`could not set the USDG approval: ${e.shortMessage || e.message}`)); }
+      if (liveNow()) try { await keepApproved(spend); } catch (e) {
+        once('approve', 600_000, () => log.warn(`could not set the USDG approval: ${e.shortMessage || e.message}`));
+        once('approve-tg', 3_600_000, () => emit({ kind: 'approve_failed', error: String(e.shortMessage || e.message).slice(0, 140) }));   // live but unable to bid
+      }
     };
     if (!ready.length) { await idle(); return { ready: 0 }; }
 
@@ -378,7 +381,10 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   async function payout(amount) {
     try {
       await sendTx('payout', { to: WSNET, data: ERC20.encodeFunctionData('transfer', [cfg.payout, amount]) }, `${fmtWs(amount)} wsNET to your main wallet ${short(cfg.payout)}`, { check: needLive });
-    } catch (e) { log.warn(`the seized wsNET stays in the bot wallet: sending it to PAYOUT_ADDRESS failed (${e.shortMessage || e.message})`); }
+    } catch (e) {
+      log.warn(`the seized wsNET stays in the bot wallet: sending it to PAYOUT_ADDRESS failed (${e.shortMessage || e.message})`);
+      emit({ kind: 'payout_failed', wsnet: fmtWs(amount), error: String(e.shortMessage || e.message).slice(0, 140) });
+    }
   }
 
   function summary(now, wallet, ready) {

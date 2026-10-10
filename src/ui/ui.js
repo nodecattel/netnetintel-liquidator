@@ -314,6 +314,11 @@ function feedLine(e) {
     case 'unlocked': return ['', 'Wallet unlocked'];
     case 'locked': return ['warn', 'Wallet locked after a restart'];
     case 'paired': return ['ok', 'Telegram linked'];
+    case 'started': return ['', `Started${e.v ? ' v' + e.v : ''}${e.locked ? ' (locked)' : ''}`];
+    case 'stalled': return ['bad', `Stuck: checks failing for ${e.sinceMin || 2}+ min (${e.error})`];
+    case 'running': return ['ok', 'Checking again'];
+    case 'payout_failed': return ['bad', `Sending ${e.wsnet} wsNET to your main wallet failed: ${e.error}`];
+    case 'approve_failed': return ['bad', `Couldn't set the USDG approval: ${e.error}`];
     default: return null;
   }
 }

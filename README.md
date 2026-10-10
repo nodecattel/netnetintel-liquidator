@@ -8,9 +8,10 @@ liquidation bonus).
 - **Your wallet, on your machine.** The key is encrypted with your page password and never leaves the computer.
 - **A page to run it**, at http://localhost:8788: make the wallet, fund it, set limits, link Telegram, go live.
 - **Dry run by default.** It finds and simulates liquidations and sends nothing until you press *Go live*.
-- **Telegram**, through @netnetintel_bot: deposits, each liquidation, misses, low gas, funds that leave the wallet
-  without the bot sending them, and pause/resume from your phone. Telegram can't change limits, switch live on or
-  move funds.
+- **Telegram**, through @netnetintel_bot: deposits, each liquidation, misses, failures, low gas, funds that leave the
+  wallet without the bot sending them, every restart, two minutes of failing checks (and the recovery), and, from
+  the bot's side, a liquidator that stops checking in for 15 minutes (computer asleep, Docker closed). Pause/resume
+  from your phone. Telegram can't change limits, switch live on or move funds.
 - **Starts in seconds.** It loads the open Loop loans from [NetNet Intel's API](https://netnetintel.com/api/v1) and
   reads the wallet right away, then scans the whole chain in the background for anything the list missed. The API is
   only a head start: every amount the bot acts on is read from the chain.

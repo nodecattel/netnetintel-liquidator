@@ -219,3 +219,28 @@ test('going live needs ETH for gas and USDG; the page says which, and how much g
     assert.equal(qr.status, 404, 'the QR is behind the login');
   } finally { p.close(); }
 });
+
+test('nothing silent: a restart is reported, and two minutes of failing checks are told once, then the recovery', async () => {
+  const p = await boot({ fetch: { relayToken: 'nnlq_' + 'B'.repeat(43) } });
+  try {
+    const events = [];
+    const orig = Date.now;
+    let fake = orig();
+    Date.now = () => fake;
+    const r = p.runner;
+    // drive the loop by hand: a start that fails, then succeeds
+    const ac = new AbortController();
+    const realStart = r.bot.start; let fails = 3;
+    r.bot.start = async () => { if (fails-- > 0) { fake += 61_000; throw new Error('RPC HTTP 503'); } return realStart(); };
+    const realTick = r.bot.tick; r.bot.tick = async () => { ac.abort(); return realTick(); };
+    await p.call('/api/password', { password: PW });
+    await r.loop(ac.signal);
+    Date.now = orig;
+    const st = (await p.call('/api/state')).body;
+    const kinds = st.events.map((e) => e.kind);
+    assert.ok(kinds.includes('started'), 'the start is an event');
+    assert.ok(kinds.includes('stalled'), 'failing for 2+ minutes is told');
+    assert.ok(kinds.includes('running'), 'and so is the recovery');
+    assert.equal(kinds.filter((k) => k === 'stalled').length, 1, 'once');
+  } finally { p.close(); }
+});
