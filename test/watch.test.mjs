@@ -295,3 +295,25 @@ test('review fix: after a restart, an old transaction does not hide a real outfl
   await again.refreshWallet();
   assert.deepEqual(events.filter((e) => e.kind === 'outflow').map((e) => e.amount), [200]);
 });
+
+test('RPC: a provider that refuses a call with an HTTP error but a JSON-RPC body (QuickNode 413) is answering, not down', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(url);
+    const body = JSON.parse(init.body);
+    if (url.startsWith('https://mine.example')) {
+      if (body.some((c) => c.method === 'eth_getLogs')) return new Response(JSON.stringify({ jsonrpc: '2.0', id: body[0].id, error: { code: -32614, message: 'eth_getLogs is limited to a 10,000 range' } }), { status: 413 });
+      return new Response(JSON.stringify(body.map((c) => ({ jsonrpc: '2.0', id: c.id, result: '0x10' }))));
+    }
+    return new Response(JSON.stringify(body.map((c) => ({ jsonrpc: '2.0', id: c.id, result: '0x20' }))));
+  };
+  const flips = [];
+  const rpc = makeRpc(() => ['https://mine.example/key', PUBLIC_RPC], { fetchImpl, onFallback: (on) => flips.push(on) });
+  const [h, logs] = await rpc([{ method: 'eth_blockNumber', params: [] }, { method: 'eth_getLogs', params: [{}] }], { together: true });
+  assert.match(logs.error.message, /10,000 range/, 'the refusal reaches the caller, which narrows its range');
+  assert.ok(h.error, 'the batch was refused as a whole');
+  assert.deepEqual(flips, [], 'no switch to the public RPC');
+  assert.equal(await rpc.one('eth_blockNumber', []), '0x10', 'and the next reads still go to your RPC');
+  const { configFrom } = await import('../src/config.mjs');
+  assert.equal(configFrom({ RPC_URL: 'https://mine.example/key' }).logsRpcUrl, PUBLIC_RPC, 'finding borrowers stays on the public RPC by default');
+});

@@ -16,7 +16,9 @@ export function configFrom(env) {
   const cfg = {
     live: flag(env.LIVE, false),
     rpcUrl: env.RPC_URL || PUBLIC_RPC,
-    logsRpcUrl: env.LOGS_RPC_URL || env.RPC_URL || PUBLIC_RPC,
+    // finding borrowers scans history in big ranges: the public RPC takes 2M blocks a request, most providers cap it
+    // (QuickNode: 10,000), and it isn't time-critical. So it stays on the public RPC unless LOGS_RPC_URL says otherwise.
+    logsRpcUrl: env.LOGS_RPC_URL || PUBLIC_RPC,
     dataDir: env.DATA_DIR || '/data',
     tickSeconds: num(env.TICK_SECONDS, 'TICK_SECONDS', 0.5) ?? DEFAULTS.tickSeconds,
     fullEverySeconds: num(env.FULL_EVERY_SECONDS, 'FULL_EVERY_SECONDS', 5) ?? DEFAULTS.fullEverySeconds,

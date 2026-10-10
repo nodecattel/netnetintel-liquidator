@@ -109,8 +109,9 @@ it in **Settings → Speed**:
 | Validation Cloud | https://www.validationcloud.io/robinhood |
 | GlobalStake | https://globalstake.io |
 
-If your RPC stops answering, the bot reads through the public one until it is back (and says so on the page and in
-the log). If it caps `eth_getLogs` (QuickNode: 10,000 blocks), leave *RPC for finding borrowers* on the public RPC.
+Paste the provider's **https://** address (the bot doesn't need wss://). If your RPC stops answering, the bot reads
+through the public one until it is back (and says so on the page and in the log). Finding borrowers (a history scan)
+stays on the public RPC by default: it allows large ranges, while most providers cap them (QuickNode: 10,000 blocks).
 
 Public endpoints (mainnet):
 
