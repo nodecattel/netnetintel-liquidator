@@ -11,6 +11,12 @@ export const MARKET_FROM_BLOCK = 16_676_769;                                    
 export const USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168';               // loan token, 6 decimals
 export const WSNET = '0x63C12667638f2Ae6fC6ae09B43D98Ec84a8586eA';              // collateral token, 18 decimals
 export const LLTV = 625_000_000_000_000_000n;                                    // 62.5%
+export const ORACLE = '0xCDE9599059f8Ae6D6B9F33A0aF7877827ec75F16';             // the market's oracle
+export const IRM = '0x2bd3d5965b26b51814ac95127b2b80dd6ccc0fa1';                // the market's interest rate model
+// The market's parameters, pinned. liquidate() is always built from these, never from what an RPC returns: Morpho
+// picks the market from the parameters it is given, so a lying RPC could otherwise point the bot's USDG at a market of
+// its own. keccak256(abi.encode(MARKET_PARAMS)) must equal MARKET_ID (checked at start and in the tests).
+export const MARKET_PARAMS = Object.freeze({ loanToken: USDG, collateralToken: WSNET, oracle: ORACLE, irm: IRM, lltv: LLTV });
 
 // Morpho Blue event topics
 export const TOPIC_BORROW = '0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240dcd85c9b5fd42a43';     // Borrow(id, caller, onBehalf ← topic2, receiver, assets, shares)

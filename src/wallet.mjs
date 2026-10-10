@@ -94,3 +94,29 @@ export function terminalPrompt() {
     stdin.on('data', onData);
   });
 }
+
+// ---- for the local page ----
+/** Save `wallet` encrypted with `pw` as the keystore (never over an existing one). */
+export async function writeKeystore(env, wallet, pw) {
+  const src = keySource(env);
+  if (src.kind === 'keystore') throw new Error('a keystore already exists; the bot won\'t replace it');
+  save(src.file, await wallet.encrypt(pw));
+  return src.file;
+}
+/** Decrypt the keystore with `pw`; null when there is none. Throws on a wrong password. */
+export async function openKeystore(env, pw) {
+  const src = keySource(env);
+  if (src.kind !== 'keystore') return null;
+  try { return await Wallet.fromEncryptedJson(read(src.file), pw); }
+  catch { throw new Error('that password does not open the wallet\'s keystore'); }
+}
+/** A wallet from what the owner pastes: a 32-byte hex key, or a 12/24-word recovery phrase (first account). */
+export function walletFromSecret(secret) {
+  const s = String(secret || '').trim();
+  if (/^(0x)?[0-9a-fA-F]{64}$/.test(s)) return new Wallet(s.startsWith('0x') ? s : '0x' + s);
+  const words = s.toLowerCase().split(/\s+/).filter(Boolean);
+  if ([12, 15, 18, 21, 24].includes(words.length)) {
+    try { return Wallet.fromPhrase(words.join(' ')); } catch { throw new Error('that recovery phrase is not valid (check the words and their order)'); }
+  }
+  throw new Error('paste a private key (64 hex characters) or a 12/24-word recovery phrase');
+}

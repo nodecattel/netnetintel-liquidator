@@ -6,6 +6,7 @@ import { AbiCoder, Interface, getAddress } from 'ethers';
 import { makeBot } from '../src/bot.mjs';
 import { MORPHO_IFACE, ERC20 } from '../src/chain.mjs';
 import { MORPHO, MARKET_ID, USDG, WSNET, LLTV, TOPIC_BORROW } from '../src/constants.mjs';
+const IRM_ADDR = '0x2bd3d5965b26b51814ac95127b2b80dd6ccc0fa1';
 
 const enc = (types, vals) => AbiCoder.defaultAbiCoder().encode(types, vals);
 const ORACLE = '0xCDE9599059f8Ae6D6B9F33A0aF7877827ec75F16', IRM = '0x2bd3d5965b26b51814ac95127b2b80dd6ccc0fa1';
@@ -173,4 +174,27 @@ test('idle: the approval is set to the spendable USDG, and not resent when the a
   await b2.start();
   await b2.tick(); await b2.tick();
   assert.equal(s2.sent.length, 0);
+});
+
+test('review fix: the market is pinned; an RPC that returns another oracle or IRM is refused', async () => {
+  const { marketIdOf } = await import('../src/bot.mjs');
+  const { MARKET_PARAMS } = await import('../src/constants.mjs');
+  assert.equal(marketIdOf(MARKET_PARAMS), MARKET_ID);
+  const evil = '0x' + 'e'.repeat(40);
+  const { rpc } = fakeChain();
+  const lying = async (calls) => (await rpc(calls)).map((r, i) => {
+    const c = calls[i];
+    if (c.method === 'eth_call' && c.params[0].data.startsWith(MORPHO_IFACE.getFunction('idToMarketParams').selector))
+      return { result: enc(['address', 'address', 'address', 'address', 'uint256'], [USDG, WSNET, evil, IRM_ADDR, LLTV]) };
+    return r;
+  });
+  lying.one = async (method, params) => { const [r] = await lying([{ method, params }]); if (r.error) throw new Error(r.error.message); return r.result; };
+  const bot = makeBot({ rpc: lying, cfg: cfg(), store: memStore(), log: quiet });
+  await assert.rejects(bot.start(), /does not return the Loopback market/);
+});
+
+test('review fix: logs show an RPC host, never its path or key', async () => {
+  const { redactUrls } = await import('../src/io.mjs');
+  assert.equal(redactUrls('failed info={"requestUrl":"https://x.quiknode.pro/abc123/"}'), 'failed info={"requestUrl":"https://x.quiknode.pro/…"}');
+  assert.equal(redactUrls('page: http://localhost:8788 · https://robin.etherscan.io/tx/0xab'), 'page: http://localhost:8788 · https://robin.etherscan.io/tx/0xab');
 });

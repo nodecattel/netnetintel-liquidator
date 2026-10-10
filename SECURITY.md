@@ -2,29 +2,40 @@
 
 The bot holds a hot wallet's key, so set it up as you would any hot wallet.
 
-**Use a wallet made for the bot only.** `new-wallet` makes one. Fund it with only the USDG you're willing to bid and a
-little ETH for gas. Keep your main funds elsewhere, and use `PAYOUT_ADDRESS` so seized wsNET moves to your main wallet
-right after each liquidation.
+**Use a wallet made for the bot.** The page makes one. Fund it with only the USDG you're willing to liquidate with and a
+little ETH for gas, keep your main funds elsewhere, and save your main wallet on the page so seized wsNET moves there
+after each liquidation.
 
-**Where the key is.** The keystore (`/data/keystore.json`) is encrypted with scrypt (the standard Ethereum keystore
-format) and readable only by its owner. Anyone with both the volume and the password has the key. Choose a strong
-password; with Compose, keep it in a file passed as a Docker secret, not in `.env` or your shell history. A raw
-`PRIVATE_KEY` is never written to disk, but it shows in `docker inspect`, so prefer the keystore (`import-key`
-converts a key).
+**The key.** It is kept as a standard Ethereum keystore (scrypt), encrypted with your page password, in the data
+volume, readable only by its owner. The recovery phrase is shown once and is never saved in readable form. After a
+restart the key stays locked until you log in, unless you turn on *Stay unlocked after restarts*. That stores the
+password in the volume (owner-only), so anyone who can copy the volume can then open the key. Use it only on a
+machine you trust.
+
+**The page.** It listens on port 8788 inside the container; publish it to `127.0.0.1` only. It answers only to
+`localhost` (a check against DNS rebinding), refuses requests from other sites (Origin check, a SameSite=Strict
+session cookie), loads nothing from the internet (a strict Content-Security-Policy), and limits wrong passwords to five
+a minute. Changing your main wallet address and withdrawing both ask for the password again, and withdrawals only go to
+that saved address. The page never shows your RPC key back.
 
 **What the bot can sign.** Only these: `liquidate()` on Morpho Blue `0x9D53…1010` for the Loopback market, `approve`
-on USDG for Morpho (the amount it may spend, never unlimited), and `transfer` of USDG or wsNET to your
-`PAYOUT_ADDRESS` or the address you give `withdraw`. It refuses to start if the market's parameters on chain aren't
-Loopback's (USDG loan, wsNET collateral, 62.5% LLTV).
+on USDG for Morpho (your spending limit, never unlimited), and `transfer` of USDG, wsNET or ETH to your saved main
+wallet. It refuses to start if the market's parameters on chain aren't Loopback's (USDG loan, wsNET collateral, 62.5%
+LLTV).
 
-**What leaves your machine.** JSON-RPC calls to `RPC_URL` and `LOGS_RPC_URL`, and Telegram messages if you set a bot
-token. No analytics and no calls home. Your RPC provider sees your wallet's address and transactions, as any wallet's
-RPC does.
+**Telegram.** A pairing code from `/liquidator` links the bot to @netnetintel_bot. NetNet Intel keeps only the code's
+hash. Through it the bot sends reports, and the only thing it reads back is whether you paused it. Telegram can't
+change limits, switch live on, or move funds. Unlink any time from the page or the chat.
 
-**Recovery.** Write down the recovery phrase that `new-wallet` shows once. It restores the wallet in any Ethereum
-wallet app. The keystore file also imports into most wallets (with its password).
+**What leaves your machine.** JSON-RPC calls to your RPC, reports to netnetintel.com when Telegram is linked (amounts,
+loan addresses, transaction hashes, a status line), and Telegram messages if you set your own bot token. No analytics.
+Your key, phrase and password never leave the machine.
 
-**Run it where you trust the machine.** A server you control, or your own computer. Don't run it on a shared host.
+**AI assistants.** An assistant can install Docker and start the container. It never needs your key, phrase,
+password or pairing code; if one was pasted into a chat, treat it as exposed (see AGENTS.md).
+
+**Recovery.** The 12 words restore the wallet in any Ethereum wallet app, or on a fresh install of this bot (import).
+A forgotten page password can't be reset because it encrypts the key: restore from the words.
 
 Found a problem? Open an issue without the details and ask for a private channel. Never post keys, passwords or
 keystore files.

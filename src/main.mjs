@@ -12,7 +12,10 @@ import { configFrom, describe } from './config.mjs';
 import { makeRpc, readTick, ERC20 } from './chain.mjs';
 import { loadWallet, newWallet, importKey, terminalPrompt, keySource } from './wallet.mjs';
 import { makeStore, makeLog, makeNotify } from './io.mjs';
-import { makeBot, runLoop } from './bot.mjs';
+import { makeBot } from './bot.mjs';
+import { makeRunner, VERSION } from './runner.mjs';
+import { startServer } from './server.mjs';
+import { makeSettings, effectiveEnv } from './settings.mjs';
 import { accrue, positionView, fmtUsdg, fmtWs } from './math.mjs';
 
 const env = process.env;
@@ -29,7 +32,9 @@ function senderOf(wallet, cfg) {
 }
 
 async function main() {
-  const cfg = configFrom(env);
+  // the local page's saved settings apply to every command; a non-empty environment variable wins
+  const saved = makeSettings(env.DATA_DIR || '/data').get();
+  const cfg = configFrom(effectiveEnv(env, saved).env);
   const log = makeLog({ json: cfg.jsonLogs });
   const prompt = terminalPrompt();
 
@@ -46,9 +51,10 @@ async function main() {
     return;
   }
 
-  if (!['run', 'scan', 'status', 'withdraw'].includes(cmd)) throw new Error(`unknown command "${cmd}" (run, scan, status, new-wallet, import-key, withdraw)`);
+  if (cmd === 'run') return run(cfg, log);
+  if (!['scan', 'status', 'withdraw'].includes(cmd)) throw new Error(`unknown command "${cmd}" (run, scan, status, new-wallet, import-key, withdraw)`);
   const rpc = makeRpc(cfg.rpcUrl, { batchSize: cfg.rpcBatch }), logsRpc = cfg.logsRpcUrl === cfg.rpcUrl ? rpc : makeRpc(cfg.logsRpcUrl, { batchSize: cfg.rpcBatch });
-  const needsWallet = cmd === 'withdraw' || cmd === 'status' || (cmd === 'run' && cfg.live);
+  const needsWallet = cmd === 'withdraw' || cmd === 'status';
   const wallet = cmd === 'scan' ? null : await loadWallet(env, { prompt });
   if (needsWallet && !wallet) {
     const src = keySource(env);
@@ -74,12 +80,23 @@ async function main() {
     return;
   }
 
-  log.info(`NetNet Loopback liquidator · ${wallet ? 'wallet ' + wallet.address : 'no wallet (dry run with simulated bids)'}`);
-  for (const l of describe(cfg)) log.info(l);
-  notify(`Loopback liquidator started (${cfg.live ? 'LIVE' : 'dry run'})${wallet ? ' · ' + wallet.address : ''}`);
+}
+
+// run: the loop and the local page (PAGE=0 for the loop only)
+async function run(cfg, log) {
+  const runner = await makeRunner({ env, log });
+  const st = runner.api.state();
+  log.info(`NetNet Loopback liquidator v${VERSION} · ${st.wallet.address ? 'wallet ' + st.wallet.address + (st.wallet.locked ? ' (locked: log in on the page)' : '') : 'no wallet yet'}`);
+  for (const l of describe(runner.cfg)) log.info(l);
+  if (env.PAGE !== '0') {
+    const port = Number(env.PAGE_PORT) || 8788;
+    const hosts = String(env.PAGE_HOSTS || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+    startServer({ runner, port, host: env.PAGE_HOST || '0.0.0.0', allowedHosts: hosts, log });
+    log.info(`page: http://localhost:${port} (on this computer; publish the port to 127.0.0.1 only)`);
+  }
   const ac = new AbortController();
-  for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { log.info('stopping'); ac.abort(); setTimeout(() => process.exit(0), 3000).unref(); });
-  await runLoop(bot, cfg, log, { signal: ac.signal });
+  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { log.info('stopping'); ac.abort(); setTimeout(() => process.exit(0), 3000).unref(); });
+  await runner.loop(ac.signal);
 }
 
 async function withdraw(wallet, cfg, rpc, [to, what = 'all']) {

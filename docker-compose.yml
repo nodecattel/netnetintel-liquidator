@@ -1,25 +1,18 @@
-# docker compose up -d     (settings in .env next to this file: copy .env.example to .env)
-# One-time wallet setup first: docker compose run --rm liquidator new-wallet
+# docker compose up -d, then open http://localhost:8788 and follow the page.
+# Settings are made on the page; a .env file is optional (see .env.example) and its values win over the page.
 services:
   liquidator:
     image: ghcr.io/nodecattel/netnetintel-liquidator:latest
     # build: .              # or build from this folder
-    container_name: netnetintel-liquidator
+    container_name: netnet-liq
     restart: unless-stopped
-    env_file: .env
+    ports:
+      - "127.0.0.1:8788:8788"   # this computer only: don't drop the 127.0.0.1
+    # env_file: .env
     volumes:
-      - liquidator-data:/data
-    # The keystore password as a file instead of an env var (recommended):
-    #   echo 'your password' > keystore_password.txt && chmod 600 keystore_password.txt
-    #   then uncomment the two blocks below and remove KEYSTORE_PASSWORD from .env
-    # secrets: [keystore_password]
-    # environment:
-    #   KEYSTORE_PASSWORD_FILE: /run/secrets/keystore_password
+      - liq-data:/data
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
-# secrets:
-#   keystore_password:
-#     file: ./keystore_password.txt
 volumes:
-  liquidator-data:
+  liq-data:

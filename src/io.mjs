@@ -20,13 +20,18 @@ export function makeStore(dir) {
   };
 }
 
-export function makeLog({ json = false } = {}) {
+// An RPC address can carry an API key in its path or query: anything logged shows the host only (explorer links stay).
+export const redactUrls = (m) => String(m).replace(/https?:\/\/([^\/\s"'?#]+)[^\s"']*/g, (u, host) => (/^(robin\.etherscan\.io|localhost(:\d+)?|127\.0\.0\.1(:\d+)?|github\.com|netnetintel\.com|t\.me)$/i.test(host) ? u : `https://${host}/…`));
+export function makeLog({ json = false, keep = 300 } = {}) {
+  const ring = [];   // the last lines, for the local page
   const line = (level, msg, extra) => {
+    msg = redactUrls(msg);
+    ring.push({ t: Date.now(), level, msg }); if (ring.length > keep) ring.shift();
     if (json) return console.log(JSON.stringify({ t: new Date().toISOString(), level, msg, ...extra }));
     const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
     console.log(`${ts} ${level === 'info' ? ' ' : level === 'warn' ? '!' : '✗'} ${msg}`);
   };
-  return { info: (m, x) => line('info', m, x), warn: (m, x) => line('warn', m, x), error: (m, x) => line('error', m, x) };
+  return { info: (m, x) => line('info', m, x), warn: (m, x) => line('warn', m, x), error: (m, x) => line('error', m, x), recent: (n = 100) => ring.slice(-n) };
 }
 
 export function makeNotify(env, log, fetchImpl = fetch) {

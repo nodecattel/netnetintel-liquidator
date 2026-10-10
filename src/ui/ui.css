@@ -1,0 +1,128 @@
+/* The netnetintel.com look: Instrument Serif headings, Inter text, the dark terminal palette by default and the
+   NetNet paper palette in light. Tokens mirror the site's src/index.css. */
+@font-face{font-family:"Instrument Serif";src:url(/fonts/serif.woff2) format("woff2");font-weight:400;font-style:normal;font-display:swap}
+@font-face{font-family:"Instrument Serif";src:url(/fonts/serif-italic.woff2) format("woff2");font-weight:400;font-style:italic;font-display:swap}
+@font-face{font-family:Inter;src:url(/fonts/inter-400.woff2) format("woff2");font-weight:400;font-display:swap}
+@font-face{font-family:Inter;src:url(/fonts/inter-500.woff2) format("woff2");font-weight:500;font-display:swap}
+@font-face{font-family:Inter;src:url(/fonts/inter-600.woff2) format("woff2");font-weight:600;font-display:swap}
+
+:root{
+  --bg:hsl(150 6% 4%);--card:hsl(150 6% 6%);--fg:hsl(45 16% 90%);--muted:hsl(45 6% 55%);--line:hsl(150 5% 14%);
+  --soft:hsl(150 5% 12%);--brand:hsl(143 64% 69%);--brand-dim:hsl(143 40% 55%);--on-brand:hsl(152 30% 8%);
+  --bad:hsl(0 45% 58%);--warn:hsl(38 80% 60%);
+  --display:"Instrument Serif",ui-serif,Georgia,serif;--body:Inter,ui-sans-serif,system-ui,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+  color-scheme:dark
+}
+:root.light{
+  --bg:hsl(43 47% 88%);--card:hsl(44 59% 92%);--fg:hsl(42 31% 13%);--muted:hsl(40 31% 26%);--line:hsl(42 43% 80%);
+  --soft:hsl(42 43% 80%);--brand:hsl(139 34% 30%);--brand-dim:hsl(140 44% 20%);--on-brand:hsl(43 47% 88%);
+  --bad:hsl(5 78% 36%);--warn:hsl(32 80% 32%);color-scheme:light
+}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:14px/1.55 var(--body);-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(ellipse 80% 50% at 85% -10%,color-mix(in srgb,var(--brand) 7%,transparent),transparent 70%)}
+a{color:var(--fg);text-underline-offset:2px}
+
+/* header — the site's bar: mark, serif wordmark, small caps controls */
+.top{border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(8px);position:sticky;top:0;z-index:5}
+.top-in{max-width:1040px;margin:0 auto;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px}
+.mark{color:var(--brand)}
+.wordmark{font:18px/1.75 var(--display);letter-spacing:-.025em}.wordmark em{color:var(--brand)}
+.tag,.link,.pill,.eyebrow,.foot{font-size:10.5px;letter-spacing:.18em;text-transform:uppercase}
+.tag{color:var(--muted);padding-left:10px;margin-left:2px;border-left:1px solid var(--line)}
+.top-right{display:flex;align-items:center;gap:10px}
+.themebtn{display:flex;align-items:center;gap:6px;background:none;border:0;padding:4px 0;color:var(--muted);font:500 10px var(--body);letter-spacing:.2em;text-transform:uppercase;cursor:pointer}
+.themebtn:hover{color:var(--fg);border:0}.themebtn .moon,:root.light .themebtn .sun{display:none}.themebtn .sun,:root.light .themebtn .moon{display:inline-flex}
+/* footer — the main app's: status · NetNet Intel · version */
+.foot{max-width:992px;margin:0 auto;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 24px;border-top:1px solid var(--line);padding:20px 0;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.foot a{color:var(--muted);text-decoration:none;display:flex;gap:6px;align-items:center}.foot a:hover{color:var(--fg)}
+.foot .plain{text-transform:none;letter-spacing:normal;color:var(--fg)}.foot .mono-plain{font-family:var(--mono);text-transform:none;letter-spacing:normal;color:var(--fg)}
+.status{display:flex;align-items:center;gap:6px}.status .dot{width:6px;height:6px;border-radius:50%;background:color-mix(in srgb,var(--muted) 50%,transparent)}
+.status .dot.ok{background:var(--brand)}.status .dot.warn{background:var(--warn)}.status .dot.bad{background:var(--bad)}
+.fine{max-width:992px;margin:0 auto;padding:0 0 28px;color:var(--muted);font-size:11px}
+
+main{max-width:1040px;margin:0 auto;padding:8px 24px 48px}
+
+/* section header — SectionHeader.jsx: rule above, serif title, muted subtitle */
+.section{border-top:1px solid var(--line);padding-top:28px;margin:8px 0 22px}
+h1{font:400 30px/1.15 var(--display);letter-spacing:-.01em;margin:0}
+h1+.sub,.sub{margin:6px 0 0;color:var(--muted);font-size:14px}
+h2{font:500 10.5px/1.4 var(--body);letter-spacing:.18em;text-transform:uppercase;margin:0 0 10px;color:var(--muted)}
+.eyebrow{color:var(--muted);font-weight:500;margin:0 0 8px}
+.muted{color:var(--muted)}.small{font-size:12px}
+p{margin:8px 0}
+
+.card>h1{font-size:26px;margin-bottom:6px}
+.card{background:color-mix(in srgb,var(--card) 60%,transparent);border:1px solid var(--line);border-radius:8px;padding:16px;margin:0 0 16px}
+.card p,.card li{color:var(--muted);font-size:13px}.card p b,.card li b{color:var(--fg);font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:16px}.grid .card{margin:0}
+.steps{display:flex;gap:6px;margin:0 0 18px;flex-wrap:wrap}
+.steps span{padding:4px 10px;border-radius:999px;border:1px solid var(--line);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.steps span.on{background:var(--brand);color:var(--on-brand);border-color:var(--brand)}.steps span.done{color:var(--brand);border-color:color-mix(in srgb,var(--brand) 45%,transparent)}
+
+label{display:block;font-weight:500;font-size:13px;margin:14px 0 6px}label .muted{font-weight:400}
+input[type=text],input[type=password],input[type=number]{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:14px var(--body)}
+input:focus{outline:1px solid var(--brand);outline-offset:0;border-color:var(--brand)}
+input[type=checkbox]{accent-color:var(--brand);margin-right:6px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px}
+
+/* buttons — the site's bordered small-caps controls; primary in brand green */
+button{font:500 11px/1 var(--body);letter-spacing:.16em;text-transform:uppercase;padding:10px 14px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer}
+button:hover{border-color:color-mix(in srgb,var(--fg) 35%,transparent)}
+button.primary{background:var(--brand);border-color:var(--brand);color:var(--on-brand);font-weight:600}
+button.primary:hover{filter:brightness(1.06)}
+button.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+
+.pill{display:inline-block;padding:4px 9px;border-radius:999px;font-weight:600;border:1px solid var(--line);margin-left:6px;color:var(--muted)}
+.pill.live{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
+.pill.run{color:var(--brand);border-color:color-mix(in srgb,var(--brand) 45%,transparent)}
+.pill.stop{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,transparent)}
+
+.note{padding:10px 12px;border-radius:6px;background:var(--soft);margin:10px 0;font-size:13px;color:var(--fg)}
+.note.warn{background:color-mix(in srgb,var(--warn) 12%,transparent);color:var(--warn)}
+.note.bad{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
+.note.ok{background:color-mix(in srgb,var(--brand) 12%,transparent);color:var(--brand)}
+.phrase{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px;margin:12px 0}
+.phrase div{background:var(--soft);border-radius:6px;padding:7px 9px;font:13px var(--mono);color:var(--fg)}
+.phrase div b{color:var(--muted);font-weight:400;margin-right:6px}
+code,.mono{font-family:var(--mono);font-size:12.5px;overflow-wrap:anywhere}
+.big{font:400 30px/1.1 var(--display);letter-spacing:-.01em;color:var(--fg);margin:2px 0 4px}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.list{list-style:none;margin:0;padding:0}.list li{padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;color:var(--fg)}.list li:last-child{border:0}
+.list time{color:var(--muted);font-size:11px;margin-right:10px;font-variant-numeric:tabular-nums}
+.check{display:flex;gap:8px;align-items:flex-start;padding:4px 0;font-size:13px}.check b{width:16px;flex:none;color:var(--muted)}
+.check.ok b{color:var(--brand)}.check.bad b{color:var(--bad)}
+.err{color:var(--bad);margin-top:8px;min-height:1em;font-size:13px}
+.pos{color:var(--brand)}.neg{color:var(--bad)}
+ol,ul{padding-left:20px}
+@media (max-width:1040px){.foot,.fine{margin:0 24px}}
+@media (max-width:560px){.top-in,main{padding-left:16px;padding-right:16px}.foot,.fine{margin:0 16px}.tag{display:none}h1{font-size:26px}.big{font-size:26px}}
+
+/* the liquidator page */
+.addr{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--soft);border-radius:6px;padding:8px 10px;margin:8px 0}
+.addr code{flex:1;min-width:0}
+.copy{padding:6px 9px;font-size:10px}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-top:6px}
+.kv div span{display:block;color:var(--muted);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase}
+.kv div b{display:block;font:400 22px/1.2 var(--display);color:var(--fg)}
+.choice{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
+.choice .card{margin:0;display:flex;flex-direction:column}.choice .card .row{margin-top:auto;padding-top:14px}
+textarea{width:100%;min-height:76px;padding:9px 11px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:13px var(--mono);resize:vertical}
+textarea:focus{outline:1px solid var(--brand);border-color:var(--brand)}
+.words3{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+details{margin-top:12px}summary{cursor:pointer;color:var(--muted);font-size:12px}
+.hint{color:var(--muted);font-size:12px;margin:4px 0 0}
+.fixed{font-size:11px;color:var(--warn)}
+.log{font:12px/1.5 var(--mono);max-height:260px;overflow:auto;background:var(--soft);border-radius:6px;padding:8px 10px;color:var(--muted)}
+.log .warn{color:var(--warn)}.log .error{color:var(--bad)}
+.tabs{display:flex;gap:6px;margin:0 0 16px;flex-wrap:wrap}
+.tablewrap{overflow-x:auto}
+@media (max-width:560px){.kv div b{font-size:20px}}
+select{padding:9px 11px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:14px var(--body)}
+.narrow{max-width:480px;margin:30px auto}.h-sm{font-size:22px!important}.mt0{margin-top:0}.mt6{margin-top:6px}.mb16{margin:0 0 16px}label.inline{margin:0}

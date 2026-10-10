@@ -19,11 +19,12 @@ export const ERC20 = new Interface([
   'function transfer(address, uint256) returns (bool)',
 ]);
 
+// url: a string, or a function returning the current one (the local page can change the RPC while the bot runs)
 export function makeRpc(url, { fetchImpl = fetch, batchSize = 40, timeoutMs = 15000 } = {}) {
   let id = 0;
   async function batch(calls) {
     const body = calls.map((c) => ({ jsonrpc: '2.0', id: ++id, method: c.method, params: c.params }));
-    const res = await fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetchImpl(typeof url === 'function' ? url() : url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
     const arr = await res.json();
     const byId = new Map((Array.isArray(arr) ? arr : [arr]).map((r) => [r.id, r]));
