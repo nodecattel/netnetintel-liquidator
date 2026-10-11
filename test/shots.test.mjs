@@ -67,3 +67,21 @@ test('a loan due to cross in ~2 s: the bid is built ahead and sent at that secon
   assert.ok(LOST_MAX === 3);
   status = 1;
 });
+
+test('dust: a loan owing under a cent (no collateral left) is not liquidatable news, not the closest loan, not a bid', async () => {
+  POS[BAD] = [0n, 1000n, 0n];                                   // a few borrow shares, no collateral: health 0, debt 0.00
+  POS[GOOD] = [0n, shares, 0x062c14a2a08dc62en * 3n];
+  const { rpc } = fakeRpc({ usdg: 200n * 10n ** 6n, allowance: 200n * 10n ** 6n });
+  const lines = [], events = [];
+  const log = { info: (m) => lines.push(m), warn: (m) => lines.push(m), error: (m) => lines.push(m), debug() {} };
+  const sender = { address: getAddress('0x1111111111111111111111111111111111111111'), nonce: async () => 1, estimateGas: async () => 1n, send: async () => { throw new Error('nothing should be sent'); } };
+  const bot = makeBot({ rpc, sender, cfg, store: memStore(), log, onEvent: (e) => events.push(e) });
+  await bot.start();
+  const r = await bot.tick();
+  assert.equal(r.ready, 0);
+  const st = bot.status();
+  assert.equal(st.closest.some((c) => c.borrower === BAD), false);
+  assert.equal(st.open, 1);
+  assert.equal(lines.some((l) => /skipped|liquidatable/.test(l)), false, lines.join('\n'));
+  assert.equal(events.some((e) => e.kind === 'nofunds'), false);
+});

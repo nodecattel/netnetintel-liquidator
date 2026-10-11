@@ -18,6 +18,9 @@ const DISCOVER_MS = 15_000, EVERYONE_MS = 10 * 60_000;
 // What gas costs here: a liquidation uses about LIQ_GAS (Morpho's liquidate plus two token transfers; the 30% gas limit
 // margin is never charged), and the wallet's ETH covers this many of them at today's price.
 export const LIQ_GAS = 250_000n;
+// Dust: loans owing under a cent (a few borrow shares, often with no collateral left). Morpho counts them past the line
+// forever, but a bid on one earns nothing: they are left out of the watch list, the closest loans and the counts.
+export const DUST_DEBT = 10_000n;
 export function gasView(gasPrice, eth) {
   if (!(gasPrice > 0n)) return null;
   const per = gasPrice * LIQ_GAS;
@@ -281,6 +284,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     for (const [b, pos] of view.positions) {
       if (pos.borrowShares === 0n) { health.delete(b); debts.delete(b); continue; }
       const v = positionView(pos, m, view.price, params.lltv);
+      if (v.debt < DUST_DEBT) { health.delete(b); debts.delete(b); continue; }
       health.set(b, v.health); debts.set(b, v.debt);
       if (v.liquidatable) ready.push({ borrower: b, pos, view: v });
     }
@@ -403,7 +407,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       let budget = spend?.usdg == null ? 0n : spend.usdg - cfg.reserve;
       if (cfg.maxRepay != null && budget > cfg.maxRepay) budget = cfg.maxRepay;
       for (const [b, pos] of view.positions) {
-        if (!(pos.borrowShares > 0n) || (cooldown.get(b) ?? 0) > now) continue;
+        if (!(pos.borrowShares > 0n) || (debts.get(b) ?? 0n) < DUST_DEBT || (cooldown.get(b) ?? 0) > now) continue;
         const at = crossingAt(pos, view.market, rate, view.price, params.lltv, nowSec, SHOT_WINDOW_SEC);
         if (at == null) continue;
         const plan = planBid(pos, accrue(view.market, rate, at + 30), view.price, params.lltv, budget > 0n ? budget : 0n, { allowPartial: cfg.allowPartial });

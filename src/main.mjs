@@ -12,7 +12,7 @@ import { configFrom, describe } from './config.mjs';
 import { makeRpc, readTick, ERC20 } from './chain.mjs';
 import { loadWallet, newWallet, importKey, terminalPrompt, keySource } from './wallet.mjs';
 import { makeStore, makeLog, makeNotify } from './io.mjs';
-import { makeBot, TOKENS, fmtTok } from './bot.mjs';
+import { makeBot, TOKENS, fmtTok, DUST_DEBT } from './bot.mjs';
 import { makeRunner, VERSION, senderOf as makeSender } from './runner.mjs';
 import { makeIntel, intelBase } from './intel.mjs';
 import { startServer } from './server.mjs';
@@ -68,7 +68,7 @@ async function main() {
     if (wallet) { const w = view.wallet, t = (k) => `${fmtTok(w[k], k)} ${TOKENS[k].sym}`; console.log(`\nBot wallet ${wallet.address}\n  ${['eth', 'usdg', 'wsnet', 'net', 'snet'].map(t).join(' · ')} · Morpho may take ${w.allowance == null ? '?' : fmtUsdg(w.allowance)} USDG\n  ${EXPLORER_ADDR}${wallet.address}`); }
     if (view.price == null) { console.log('\nThe oracle gives no price right now (its guard holds): no loan can be liquidated.'); return; }
     const m = accrue(view.market, view.rate, view.block.timestamp);
-    const rows = [...view.positions].filter(([, p]) => p.borrowShares > 0n).map(([b, p]) => ({ b, p, v: positionView(p, m, view.price, params.lltv) })).sort((a, b) => a.v.health - b.v.health);
+    const rows = [...view.positions].filter(([, p]) => p.borrowShares > 0n).map(([b, p]) => ({ b, p, v: positionView(p, m, view.price, params.lltv) })).filter((r) => r.v.debt >= DUST_DEBT).sort((a, b) => a.v.health - b.v.health);
     const n = cmd === 'scan' ? rows.length : Math.min(10, rows.length);
     console.log(`\n${rows.length} open loans at block ${view.block.number.toLocaleString()} (health: 1.000 is the 62.5% line; under it, anyone can liquidate)\n`);
     for (const r of rows.slice(0, n)) console.log(`  ${r.v.liquidatable ? 'LIQUIDATABLE' : '            '}  ${r.b}  health ${r.v.health.toFixed(4)}  debt ${fmtUsdg(r.v.debt).padStart(12)} USDG  collateral ${fmtWs(r.p.collateral).padStart(14)} wsNET`);

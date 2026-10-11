@@ -1,6 +1,6 @@
 {
   "name": "netnetintel-liquidator",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "description": "Self-run liquidation bot for the NetNet Loopback market on Morpho Blue (Robinhood Chain): your own wallet, your limits.",
   "type": "module",
