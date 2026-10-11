@@ -31,6 +31,12 @@ export const SNET = '0xb773ec2C326B7f98a5a83fc098825492F020a4c7';               
 export const LLTV = 625_000_000_000_000_000n;                                    // 62.5%
 export const ORACLE = '0xCDE9599059f8Ae6D6B9F33A0aF7877827ec75F16';             // the market's oracle
 export const IRM = '0x2bd3d5965b26b51814ac95127b2b80dd6ccc0fa1';                // the market's interest rate model
+// what moves the oracle's price, watched over the WebSocket (watch.mjs): the oracle credits wsNET at
+// clamp(0.9 × TWAP, NAV, 5 × NAV) × the staking index; the TWAP comes from the NET/USDG pair through the pair oracle
+export const PAIR = '0x59F95461E68e0c77605299791E1449f175165B54';               // NET/USDG (Uniswap V2), the TWAP's source
+export const PAIR_ORACLE = '0x929631b33F4070D6f54477fba3FD27566567dAca';        // twapNetUsdg(), checkpointed now and then
+export const TREASURY = '0x04822Ea321A0DEE6F40656172F29312104855d66';           // NAV (backingPerToken), the oracle's floor
+export const STAKING = '0xB078cc304A0B264C5F3680DC0488954ACcd02E87';            // rebases move the staking index
 // The market's parameters, pinned. liquidate() is always built from these, never from what an RPC returns: Morpho
 // picks the market from the parameters it is given, so a lying RPC could otherwise point the bot's USDG at a market of
 // its own. keccak256(abi.encode(MARKET_PARAMS)) must equal MARKET_ID (checked at start and in the tests).

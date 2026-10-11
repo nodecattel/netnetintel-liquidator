@@ -74,7 +74,7 @@ export function startServer({ runner, port = 8788, host = '0.0.0.0', allowedHost
     'POST /api/wallet/import': async (_r, b) => api.importWallet(b.secret),
     'POST /api/settings': async (_r, b) => {
       const { password, ...rest } = b || {};
-      if ('payoutAddress' in rest || 'rpcUrl' in rest || 'logsRpcUrl' in rest) await needPw(password);
+      if ('payoutAddress' in rest || 'rpcUrl' in rest || 'logsRpcUrl' in rest || 'wssUrl' in rest) await needPw(password);
       return api.saveSettings(rest, password);   // (runner.saveSettings checks the password again for the payout address)
     },
     'POST /api/live': async (_r, b) => api.setLive(!!b.on, b.confirm),

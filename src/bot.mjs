@@ -6,7 +6,7 @@
 import { getAddress, MaxUint256, AbiCoder, keccak256 } from 'ethers';
 import { MORPHO, MARKET_ID, MARKET_FROM_BLOCK, MARKET_PARAMS, USDG, WSNET, EXPLORER_TX } from './constants.mjs';
 import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, readWallet, scanBorrowers, simulate } from './chain.mjs';
-import { accrue, positionView, planBid, crossingAt, fmtUsdg, fmtWs } from './math.mjs';
+import { accrue, positionView, planBid, crossingAt, pricePath, fmtUsdg, fmtWs } from './math.mjs';
 
 // Interest keeps accruing between the read and the block the bid lands in: bids are sized (and approvals set) on the
 // debt as it will be HEADROOM_SEC from now, so the USDG Morpho pulls never exceeds what was planned or approved.
@@ -39,6 +39,8 @@ const LIQ_TOPIC = MORPHO_IFACE.getEvent('Liquidate').topicHash;
 export const SHOT_WINDOW_SEC = 90, SHOT_GAS = 600_000n, LOST_MAX = 3, LOST_PAUSE_MS = 10 * 60_000, RACES_EVERY_MS = 60 * 60_000;
 const SHOT_LAG_MS = 120;            // after the chain clock reaches the second: lands in its first block, not the one before
 const CLOCK_SAMPLES = 30;
+// with a loan this close to the line (or a timed bid waiting), each check also reads the oracle's price AHEAD_SEC out
+export const AHEAD_HEALTH = 1.03, AHEAD_SEC = [30, 60, 90];
 
 // Wallet balances: units per token, the smallest change worth a word, and how a change is shown
 export const TOKENS = { eth: { dec: 18, dust: 10n ** 12n, sym: 'ETH' }, usdg: { dec: 6, dust: 10_000n, sym: 'USDG' }, wsnet: { dec: 18, dust: 10n ** 12n, sym: 'wsNET' },
@@ -259,7 +261,11 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       : [...known].filter((a) => fresh.has(a) || (health.get(a) ?? Infinity) < cfg.hotHealth);
     if (everyone) lastEveryone = now;
     // the rate moves slowly: re-read with every full pass (and until a read succeeds)
-    const view = await readTick(rpc, params, me, list, { rate: full || rate == null ? null : rate });
+    const near = shots.size > 0 || [...health.values()].some((h) => h < AHEAD_HEALTH);
+    const chainNow = Date.now() / 1000 + chainOffset();
+    const ahead = near && clock.length ? AHEAD_SEC.map((d) => chainNow + d) : [];
+    const view = await readTick(rpc, params, me, list, { rate: full || rate == null ? null : rate, ahead });
+    if (ahead.length && !view.priceAhead) once('ahead', 3_600_000, () => log.info('this RPC does not read the oracle ahead (block-time overrides): timed bids follow interest only'));
     if (full || rate == null) rate = view.rate;
     if (view.rate == null) once('rate', 600_000, () => log.warn('the interest rate did not read: debts are figured without the interest since the market last moved'));
     if (full) lastFull = now;
@@ -403,14 +409,16 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   async function armShots(view, spend, nowSec, now) {
     const live = liveNow() && me && rate != null && rate > 0n;
     const keep = new Set();
+    // interest, and the oracle's drift: between swaps the TWAP moves toward the pool's price second by second
+    const priceAt = view.priceAhead ? pricePath([{ t: nowSec, price: view.price }, ...view.priceAhead]) : null;
     if (live) {
       let budget = spend?.usdg == null ? 0n : spend.usdg - cfg.reserve;
       if (cfg.maxRepay != null && budget > cfg.maxRepay) budget = cfg.maxRepay;
       for (const [b, pos] of view.positions) {
         if (!(pos.borrowShares > 0n) || (debts.get(b) ?? 0n) < DUST_DEBT || (cooldown.get(b) ?? 0) > now) continue;
-        const at = crossingAt(pos, view.market, rate, view.price, params.lltv, nowSec, SHOT_WINDOW_SEC);
+        const at = crossingAt(pos, view.market, rate, view.price, params.lltv, nowSec, SHOT_WINDOW_SEC, priceAt);
         if (at == null) continue;
-        const plan = planBid(pos, accrue(view.market, rate, at + 30), view.price, params.lltv, budget > 0n ? budget : 0n, { allowPartial: cfg.allowPartial });
+        const plan = planBid(pos, accrue(view.market, rate, at + 30), priceAt ? priceAt(at) : view.price, params.lltv, budget > 0n ? budget : 0n, { allowPartial: cfg.allowPartial });
         if (plan.skip || plan.profit < cfg.minProfit) continue;
         keep.add(b);
         const have = shots.get(b);
@@ -432,7 +440,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       const shot = { at, plan, nonce, timer: null };
       shot.timer = setTimeout(() => { fire(borrower, shot, tx).catch(() => null); }, wait);
       shots.set(borrower, shot);
-      once(`armed:${borrower}:${at}`, 600_000, () => log.info(`${short(borrower)} crosses the line from interest in ${Math.round(wait / 1000)} s: a ${plan.mode} bid (repay ${fmtUsdg(plan.repaid)} USDG, +${fmtUsdg(plan.profit)}) goes out at that second`));
+      once(`armed:${borrower}:${at}`, 600_000, () => log.info(`${short(borrower)} crosses the line in ${Math.round(wait / 1000)} s (interest${view.priceAhead ? ' and the oracle\'s drift' : ''}): a ${plan.mode} bid (repay ${fmtUsdg(plan.repaid)} USDG, +${fmtUsdg(plan.profit)}) goes out at that second`));
     } catch (e) {
       once(`arm:${borrower}`, 600_000, () => log.warn(`${short(borrower)}: could not prepare a timed bid (${e.shortMessage || e.message})`));
     }

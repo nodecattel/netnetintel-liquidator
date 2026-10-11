@@ -20,7 +20,7 @@ function writePrivate(file, text) {
 }
 
 // the setting names as the environment spells them: settings.json uses the same keys
-export const SETTING_KEYS = ['LIVE', 'MAX_REPAY_USDG', 'RESERVE_USDG', 'MIN_PROFIT_USDG', 'ALLOW_PARTIAL', 'PAYOUT_ADDRESS', 'RPC_URL', 'LOGS_RPC_URL', 'TICK_SECONDS'];
+export const SETTING_KEYS = ['LIVE', 'MAX_REPAY_USDG', 'RESERVE_USDG', 'MIN_PROFIT_USDG', 'ALLOW_PARTIAL', 'PAYOUT_ADDRESS', 'RPC_URL', 'LOGS_RPC_URL', 'RPC_WSS_URL', 'TICK_SECONDS'];
 
 export function makeSettings(dir) {
   const file = `${dir}/settings.json`, authFile = `${dir}/auth.json`, unlockFile = `${dir}/.unlock`;

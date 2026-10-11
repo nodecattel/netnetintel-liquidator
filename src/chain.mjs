@@ -119,13 +119,18 @@ export async function readWallet(rpc, me) {
 
 /** One tick's reads in one round trip: block, market, oracle price, wallet balances, and the positions asked for.
  *  The IRM's rate needs the market tuple, so it is a second, single call. */
-export async function readTick(rpc, params, me, borrowers, { rate: knownRate = null } = {}) {
+// ahead: chain timestamps to also read the oracle's price at (eth_call with a block-time override). Between swaps the
+// TWAP keeps drifting toward the pool's price block by block, so the price a few seconds out is known now; a node that
+// doesn't take overrides just leaves these out (priceAhead: null).
+export async function readTick(rpc, params, me, borrowers, { rate: knownRate = null, ahead = [] } = {}) {
   const calls = [
     { method: 'eth_getBlockByNumber', params: ['latest', false] },
     call(MORPHO, MORPHO_IFACE.encodeFunctionData('market', [MARKET_ID])),
     call(params.oracle, ORACLE.encodeFunctionData('price', [])),
     { method: 'eth_gasPrice', params: [] },
   ];
+  const abase = calls.length;
+  for (const t of ahead) calls.push({ method: 'eth_call', params: [{ to: params.oracle, data: ORACLE.encodeFunctionData('price', []) }, 'latest', {}, { time: '0x' + Math.floor(t).toString(16) }] });
   const wbase = calls.length;
   if (me) calls.push(...walletCalls(me));
   const base = calls.length;
@@ -138,6 +143,8 @@ export async function readTick(rpc, params, me, borrowers, { rate: knownRate = n
   // the oracle reverts while its guard holds (pool far under the TWAP): no price, no liquidations
   const price = ok(r[2]) ? BigInt(r[2].result) : null;
   const gasPrice = r[3]?.result ? BigInt(r[3].result) : null;
+  const pa = ahead.map((t, i) => (ok(r[abase + i]) ? { t: Math.floor(t), price: BigInt(r[abase + i].result) } : null));
+  const priceAhead = ahead.length && pa.every(Boolean) ? pa : null;
   const wallet = me ? parseWallet(r.slice(wbase, base)) : null;
   const positions = new Map();
   borrowers.forEach((b, i) => {
@@ -151,7 +158,7 @@ export async function readTick(rpc, params, me, borrowers, { rate: knownRate = n
     const data = IRM.encodeFunctionData('borrowRateView', [paramsTuple(params), [market.totalSupplyAssets, market.totalSupplyShares, market.totalBorrowAssets, market.totalBorrowShares, market.lastUpdate, market.fee]]);
     rate = BigInt(await rpc.one('eth_call', [{ to: params.irm, data }, 'latest']));
   } catch { rate = null; /* unread: the bot re-reads it next tick */ }
-  return { block, market, price, rate, gasPrice, wallet, positions };
+  return { block, market, price, priceAhead, rate, gasPrice, wallet, positions };
 }
 
 /** Borrowers from Borrow events on the market, from `from` to `to`, in ranges that halve when the RPC refuses. */

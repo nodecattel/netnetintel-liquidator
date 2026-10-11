@@ -93,13 +93,27 @@ export function planBid(pos, m, price, lltv, budget, { allowPartial = true } = {
 /** The first chain second in (fromSec, fromSec + maxSec] at which interest alone puts the position past the line, at this
  *  price and rate (Morpho's liquidate() accrues to the block's timestamp first). null: already past it, no interest, or
  *  not within maxSec. */
-export function crossingAt(pos, market, ratePerSec, price, lltv, fromSec, maxSec) {
-  const past = (t) => positionView(pos, accrue(market, ratePerSec, t), price, lltv).liquidatable;
+export function crossingAt(pos, market, ratePerSec, price, lltv, fromSec, maxSec, priceAt = null) {
+  const past = (t) => positionView(pos, accrue(market, ratePerSec, t), priceAt ? priceAt(t) : price, lltv).liquidatable;
   fromSec = Math.floor(fromSec);
-  if (!(ratePerSec > 0n) || !(pos.borrowShares > 0n) || past(fromSec) || !past(fromSec + maxSec)) return null;
+  if (!(pos.borrowShares > 0n) || (!(ratePerSec > 0n) && !priceAt) || past(fromSec) || !past(fromSec + maxSec)) return null;
   let lo = fromSec, hi = fromSec + maxSec;
   while (hi - lo > 1) { const mid = Math.floor((lo + hi) / 2); if (past(mid)) hi = mid; else lo = mid; }
   return hi;
+}
+
+/** The oracle's price over the next seconds, from points [{ t, price }] read ahead: straight lines between them, flat
+ *  before the first and after the last. (Between swaps the TWAP drifts smoothly; a swap re-reads it.) */
+export function pricePath(points) {
+  const p = [...points].sort((a, b) => a.t - b.t);
+  return (t) => {
+    if (t <= p[0].t) return p[0].price;
+    for (let i = 1; i < p.length; i++) if (t <= p[i].t) {
+      const a = p[i - 1], b = p[i];
+      return a.price + ((b.price - a.price) * BigInt(Math.round((t - a.t) * 1000))) / BigInt(Math.round((b.t - a.t) * 1000));
+    }
+    return p[p.length - 1].price;
+  };
 }
 
 export const fmtUsdg = (v) => (Number(v) / 1e6).toFixed(2);

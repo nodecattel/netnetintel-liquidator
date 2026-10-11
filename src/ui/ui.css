@@ -153,6 +153,7 @@ select{padding:9px 11px;border:1px solid var(--line);border-radius:6px;backgroun
 .txs td{vertical-align:top}.txs .hint{font-size:11.5px;max-width:420px}
 .eps td{vertical-align:top;font-size:12.5px}.eps td:first-child{color:var(--muted);white-space:nowrap;width:1%}
 .warn-t{color:var(--warn)}
+.ok-t{color:var(--ok)}
 #fulllog .log{margin-top:8px}
 @media (max-width:560px){.txs th:nth-child(4),.txs td:nth-child(4){display:none}.feed time{min-width:52px}}
 td code{white-space:nowrap}.log div{overflow-wrap:anywhere}

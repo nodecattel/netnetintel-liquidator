@@ -2,6 +2,7 @@
 import { getAddress } from 'ethers';
 import { DEFAULTS, PUBLIC_RPC, PUBLIC_SEQUENCER } from './constants.mjs';
 import { usdgUnits } from './math.mjs';
+import { wssFrom } from './watch.mjs';
 
 const num = (v, name, min = 0) => {
   if (v == null || v === '') return null;
@@ -19,6 +20,9 @@ export function configFrom(env) {
     // finding borrowers scans history in big ranges: the public RPC takes 2M blocks a request, most providers cap it
     // (QuickNode: 10,000), and it isn't time-critical. So it stays on the public RPC unless LOGS_RPC_URL says otherwise.
     logsRpcUrl: env.LOGS_RPC_URL || PUBLIC_RPC,
+    // the live feed (watch.mjs): the RPC's wss:// address. QuickNode's is filled in from its https one; off to turn it off.
+    wssUrl: /^(off|0|false|no)$/i.test(String(env.RPC_WSS_URL || '')) ? null : (env.RPC_WSS_URL || wssFrom(env.RPC_URL || '') || null),
+    wssAuto: !env.RPC_WSS_URL && !!wssFrom(env.RPC_URL || ''),
     dataDir: env.DATA_DIR || '/data',
     tickSeconds: num(env.TICK_SECONDS, 'TICK_SECONDS', 0.5) ?? DEFAULTS.tickSeconds,
     fullEverySeconds: num(env.FULL_EVERY_SECONDS, 'FULL_EVERY_SECONDS', 5) ?? DEFAULTS.fullEverySeconds,
@@ -40,6 +44,7 @@ export function configFrom(env) {
     debug: /^debug$/i.test(String(env.LOG_LEVEL || '')),
   };
   if (cfg.sequencerUrl && !/^https:\/\/[^\s]+$/.test(cfg.sequencerUrl)) throw new Error('SEQUENCER_URL must be an https:// address, or off');
+  if (cfg.wssUrl && !/^wss:\/\/[^\s]+$/.test(cfg.wssUrl)) throw new Error('RPC_WSS_URL must be a wss:// address, or off');
   cfg.minLogRange = Math.min(cfg.minLogRange, cfg.logRange);
   return cfg;
 }

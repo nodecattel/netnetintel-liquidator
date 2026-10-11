@@ -223,6 +223,12 @@ function readLimits() {
   return { maxRepayUsdg: $('max').value, reserveUsdg: $('res').value, minProfitUsdg: $('minp').value, allowPartial: $('part').checked, tickSeconds: $('tick').value };
 }
 // ---- speed: the RPC (public by default; your own is faster) ----
+// the live feed in a line: on (and when it last woke the bot), reconnecting, or off
+function liveFeedLine(f) {
+  if (!f) return '<b>Live feed off</b>: the bot checks on its timer.';
+  if (f.connected) return `<b class="ok-t">Live feed on</b> (${esc(f.host || '')})${f.lastEventAt ? `: last woke the bot ${esc(ago(f.lastEventAt))} (${esc(f.lastKind || '')})` : ': waiting for the first event'}.`;
+  return `<b class="warn-t">Live feed reconnecting</b>${f.error ? ` (${esc(f.error)})` : ''}: checks stay on the timer meanwhile.`;
+}
 function speedCard(s) {
   const r = S.status.rpc, fx = (k) => (s.fixed.includes(k) ? ' <span class="fixed">set by the environment</span>' : '');
   const now = r?.host ? `<b>${esc(r.host)}</b>${r.ms != null ? ` · about ${r.ms} ms a read` : ''}` : 'not connected yet';
@@ -232,7 +238,9 @@ function speedCard(s) {
     ${s.customRpc ? '' : '<div class="note">The public RPC is shared by everyone and rate-limited. Liquidations are a race, so your own RPC from a provider is faster and steadier. Most have a free tier.</div>'}
     <p class="hint">Providers with Robinhood Chain RPC:</p><div class="providers">${(s.providers || []).map(([name, url]) => `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(name)} ↗</a>`).join('')}</div>
     <label for="rpc">Your RPC address${fx('RPC_URL')} <span class="muted">(empty: the public RPC)</span></label><input id="rpc" type="text" autocomplete="off" spellcheck="false" placeholder="${s.customRpc ? esc(s.rpcUrl || 'saved') + ' (saved: type a new one to replace)' : 'https://…'}">
-    <p class="hint">${s.rpcFallback ? 'If it stops answering, the bot uses the public RPC until it is back. ' : ''}Use its https:// address (not wss://). Finding borrowers stays on the public RPC, which allows large history ranges; most providers cap them (QuickNode: 10,000 blocks), so leave the next field empty unless yours doesn't.</p>
+    <p class="hint">${s.rpcFallback ? 'If it stops answering, the bot uses the public RPC until it is back. ' : ''}Use its https:// address here. Finding borrowers stays on the public RPC, which allows large history ranges; most providers cap them (QuickNode: 10,000 blocks), so leave the next field empty unless yours doesn't.</p>
+    <label for="wss">Live feed: your RPC's wss:// address${fx('RPC_WSS_URL')} <span class="muted">(optional)</span></label><input id="wss" type="text" autocomplete="off" spellcheck="false" placeholder="${S.feed ? (S.feed.auto ? 'from your QuickNode address (type one to replace, or off)' : 'saved (type a new one to replace, or off)') : 'wss://…'}">
+    <p class="hint">${liveFeedLine(S.feed)} With it, a swap, an oracle checkpoint or a market event wakes the bot the moment it lands instead of at its next check. Robinhood Chain's public RPC has no WebSocket; QuickNode's is filled in from its https:// address.</p>
     <label for="lrpc">RPC for finding borrowers${fx('LOGS_RPC_URL')} <span class="muted">(empty: the public RPC)</span></label><input id="lrpc" type="text" autocomplete="off" spellcheck="false" placeholder="${s.logsRpc ? 'saved (type a new one to replace)' : esc(e.rpc || '')}">
     <label for="rpw">Page password <span class="muted">(an RPC decides what the bot believes, so changing one needs it)</span></label><input id="rpw" type="password" autocomplete="current-password">
     <div class="row"><button class="primary" id="saverpc">Save RPC</button>${s.customRpc ? '<button id="clrrpc">Back to the public RPC</button>' : ''}</div><div class="err" id="er" role="alert"></div>
@@ -249,10 +257,11 @@ function wireSpeed() {
     const b = { password: $('rpw').value };
     if ($('rpc').value.trim()) b.rpcUrl = $('rpc').value.trim();
     if ($('lrpc').value.trim()) b.logsRpcUrl = $('lrpc').value.trim();
-    if (!b.rpcUrl && !b.logsRpcUrl) return err('er', 'Paste an RPC address first');
+    if ($('wss').value.trim()) b.wssUrl = $('wss').value.trim();
+    if (!b.rpcUrl && !b.logsRpcUrl && !b.wssUrl) return err('er', 'Paste an RPC address first');
     save(b);
   };
-  if ($('clrrpc')) $('clrrpc').onclick = () => save({ rpcUrl: '', logsRpcUrl: '', password: $('rpw').value });
+  if ($('clrrpc')) $('clrrpc').onclick = () => save({ rpcUrl: '', logsRpcUrl: '', wssUrl: '', password: $('rpw').value });
 }
 function payoutFields(s) {
   return `<label for="pay">Your main wallet${s.fixed.includes('PAYOUT_ADDRESS') ? ' <span class="fixed">set by the environment</span>' : ''} <span class="muted">(optional)</span></label>

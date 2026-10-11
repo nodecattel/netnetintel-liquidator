@@ -13,6 +13,7 @@ import { makeBot, TOKENS, fmtTok, isRevert } from './bot.mjs';
 import { makeIntel, intelBase, walletValue } from './intel.mjs';
 import { makeSettings, effectiveEnv } from './settings.mjs';
 import { makeRelay, TOKEN_RE } from './relay.mjs';
+import { makeWatch } from './watch.mjs';
 import { fmtUsdg, fmtWs } from './math.mjs';
 
 export const VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -163,6 +164,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     const before = cfg.rpcUrl;
     Object.assign(cfg, configFrom(derived().env));
     if (wallet && cfg.rpcUrl !== before) { sender = newSender(wallet); bot.setSender(sender); log.info(`RPC changed to ${cfg.rpcUrl}`); }
+    syncWatch();   // a new RPC (QuickNode: its wss:// comes with it) or a new wss:// address
   }
   const localPaused = () => !!settings.get().paused;
   const checkCopies = () => {
@@ -196,7 +198,33 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
   };
   const worked = () => { if (stallTold) onEvent({ kind: 'running', downMin: Math.round((Date.now() - failingSince) / 60e3) }); failingSince = null; stallTold = false; };
 
+  // ---- the live feed: a swap, an oracle checkpoint, a NAV or index move, or a market event wakes the loop at once ----
+  let wakeUp = null, woken = false, watch = null, watchUrl = null;
+  const MIN_WAKE_MS = 250;                         // a burst of logs in one block is one check
+  let lastWake = 0;
+  const wake = (kind) => {
+    log.debug?.(`live feed: ${kind}`);
+    woken = true;
+    if (wakeUp) { const f = wakeUp; wakeUp = null; setTimeout(f, Math.max(0, lastWake + MIN_WAKE_MS - Date.now())); }
+  };
+  function syncWatch() {
+    if (cfg.wssUrl === watchUrl) return;
+    watch?.stop(); watch = null; watchUrl = cfg.wssUrl;
+    if (watchUrl) { watch = makeWatch({ url: watchUrl, onWake: wake, log }); watch.start(); }
+  }
+  // the timer, or the live feed, whichever comes first
+  const nap = (ms, signal) => {
+    if (woken) { woken = false; return Promise.resolve(); }
+    return new Promise((r) => {
+      const t = setTimeout(done, ms);
+      function done() { clearTimeout(t); wakeUp = null; woken = false; lastWake = Date.now(); r(); }
+      wakeUp = done;
+      signal?.addEventListener?.('abort', done, { once: true });
+    });
+  };
+
   async function loop(signal) {
+    syncWatch();
     let wait = 5_000;
     log.info(`connecting to ${redactRpc(cfg.rpcUrl)}${cfg.rpcUrl === PUBLIC_RPC ? ' (the public RPC)' : ''}${intel.enabled ? ' · loans from NetNet Intel' : ''}`);
     onEvent({ kind: 'started', v: VERSION, live: cfg.live, locked: locked() });   // a restart (reboot, update, crash) is never silent
@@ -219,7 +247,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
       try { await bot.tick(); errors = 0; worked(); }
       catch (e) { errors++; failed(e); if (errors === 1 || errors % 30 === 0) log.warn(`tick failed (${errors} in a row): ${e.message}`); }
       await relay.flush().catch(() => null);
-      await sleep(Math.max(200, cfg.tickSeconds * 1000 * (errors > 3 ? 3 : 1) - (Date.now() - t0)), signal);
+      await nap(Math.max(200, cfg.tickSeconds * 1000 * (errors > 3 ? 3 : 1) - (Date.now() - t0)), signal);
     }
   }
 
@@ -282,6 +310,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
           logsRpc: !!(saved.LOGS_RPC_URL || env.LOGS_RPC_URL), tickSeconds: cfg.tickSeconds, live: cfg.live, paused: localPaused(), stayUnlocked: settings.unlockSaved(), fixed,
         },
         status: bot.status(),
+        feed: watch ? { ...watch.status(), auto: cfg.wssAuto } : null,
         market: marketView(),
         telegram: { linked: relay.linked, paused: relay.paused, error: relay.lastError, revoked: relay.revoked, direct: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) },
         history: store.history().slice(-50).reverse(), txs: store.txs().slice(-40).reverse(), events: events.filter((e) => e.kind !== 'tx').slice(-30).reverse(), log: log.recent ? log.recent(60) : [],
@@ -324,7 +353,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     async saveSettings(b, password) {
       const patch = {};
       const fixed = derived().fixed;
-      const FIELD = { maxRepayUsdg: 'MAX_REPAY_USDG', reserveUsdg: 'RESERVE_USDG', minProfitUsdg: 'MIN_PROFIT_USDG', allowPartial: 'ALLOW_PARTIAL', tickSeconds: 'TICK_SECONDS', rpcUrl: 'RPC_URL', logsRpcUrl: 'LOGS_RPC_URL', payoutAddress: 'PAYOUT_ADDRESS' };
+      const FIELD = { maxRepayUsdg: 'MAX_REPAY_USDG', reserveUsdg: 'RESERVE_USDG', minProfitUsdg: 'MIN_PROFIT_USDG', allowPartial: 'ALLOW_PARTIAL', tickSeconds: 'TICK_SECONDS', rpcUrl: 'RPC_URL', logsRpcUrl: 'LOGS_RPC_URL', wssUrl: 'RPC_WSS_URL', payoutAddress: 'PAYOUT_ADDRESS' };
       for (const [k, key] of Object.entries(FIELD)) if (k in b && fixed.includes(key)) delete b[k];   // the environment wins: shown as fixed on the page
       const num = (v, name, min = 0, max = 1e7) => {
         if (v === '' || v == null) return undefined;
@@ -340,6 +369,11 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
         const u = String(b[k] || '').trim();
         if (u && !/^https:\/\/[^\s]+$/.test(u)) throw httpErr(400, 'an RPC address starts with https://');
         patch[key] = u || undefined;
+      }
+      if ('wssUrl' in b) {
+        const u = String(b.wssUrl || '').trim();
+        if (u && !/^(wss:\/\/[^\s]+|off)$/.test(u)) throw httpErr(400, 'a WebSocket address starts with wss:// (or type off)');
+        patch.RPC_WSS_URL = u || undefined;
       }
       if ('payoutAddress' in b) {
         if (!(await settings.checkPassword(password))) throw httpErr(401, 'enter the page password to change where funds go');

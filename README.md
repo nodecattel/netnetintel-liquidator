@@ -130,9 +130,21 @@ it in **Settings → Speed**:
 | Validation Cloud | https://www.validationcloud.io/robinhood |
 | GlobalStake | https://globalstake.io |
 
-Paste the provider's **https://** address (the bot doesn't need wss://). If your RPC stops answering, the bot reads
+Paste the provider's **https://** address. If your RPC stops answering, the bot reads
 through the public one until it is back (and says so on the page and in the log). Finding borrowers (a history scan)
 stays on the public RPC by default: it allows large ranges, while most providers cap them (QuickNode: 10,000 blocks).
+
+**Live feed (wss://, optional).** With your provider's WebSocket address the bot subscribes to what moves a loan: the
+NET/USDG pair's swaps, the pair oracle's checkpoints, the Treasury (NAV), staking (the index) and the Loopback market
+itself. Each one wakes it to check at once instead of at its next 2 s check. Every figure is still read over https,
+and the regular checks carry on underneath, so a dropped WebSocket costs nothing but speed (it reconnects on its own).
+QuickNode's wss:// address is filled in from its https:// one; others go in Settings → Speed (or `RPC_WSS_URL`;
+`off` turns it off). Robinhood Chain's public RPC has no WebSocket.
+
+**The oracle, read ahead.** Between swaps NET's TWAP drifts toward the pool's price second by second, so the oracle's
+price a minute out is already known. When a loan is near the line the bot also reads it 30, 60 and 90 s ahead (an
+`eth_call` with a block-time override, in the same batch) and times its bid to the second interest and that drift tip
+the loan over. A node that doesn't take overrides leaves timed bids on interest alone.
 
 Public endpoints (mainnet):
 
