@@ -117,6 +117,18 @@ export async function readWallet(rpc, me) {
   return { block: r[0]?.result ? parseInt(r[0].result, 16) : null, gasPrice: big(r[1]), wallet: parseWallet(r.slice(2)) };
 }
 
+/** The oracle's price at each of `times` (chain seconds), in one round trip: [{ t, price }], or null when the node
+ *  doesn't take block-time overrides or any read failed. Used to find the exact second a loan crosses the line: between
+ *  swaps the TWAP curves toward the pool's price (fastest at first), so a straight line between reads 30 s apart puts
+ *  the crossing a second or two late. */
+export async function readPricesAt(rpc, oracle, times) {
+  if (!times.length) return [];
+  const calls = times.map((t) => ({ method: 'eth_call', params: [{ to: oracle, data: ORACLE.encodeFunctionData('price', []) }, 'latest', {}, { time: '0x' + Math.floor(t).toString(16) }] }));
+  const r = await rpc(calls);
+  const out = times.map((t, i) => (ok(r[i]) ? { t: Math.floor(t), price: BigInt(r[i].result) } : null));
+  return out.every(Boolean) ? out : null;
+}
+
 /** One tick's reads in one round trip: block, market, oracle price, wallet balances, and the positions asked for.
  *  The IRM's rate needs the market tuple, so it is a second, single call. */
 // ahead: chain timestamps to also read the oracle's price at (eth_call with a block-time override). Between swaps the

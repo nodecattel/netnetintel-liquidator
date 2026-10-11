@@ -81,10 +81,11 @@ Morpho says "position is healthy" and nothing is sent.
 
 **Timed bids.** Most Loopback liquidations happen because interest alone pushes a loan over the line, at a second that
 can be worked out in advance, and other bots fire at that second. So for a loan due to cross within 90 seconds, the bot
-builds the bid ahead (nonce, fees, a fixed gas limit) and sends it the moment the chain's clock reaches that second,
-with no simulation first. If another bot lands first, the bid reverts and costs only its gas (a fraction of a cent).
+builds the bid ahead (nonce, fees, a fixed gas limit, signed) and sends it the moment the chain's clock reaches that
+second, with no simulation first and without waiting behind any other transaction. If another bot lands first, the bid reverts and costs only its gas (a fraction of a cent).
 After 3 lost in a row on one borrower it leaves that loan alone for 10 minutes. Lost races are summed up once an hour
-on Telegram and in the feed.
+on Telegram and in the feed, and the log says which second each lost bid landed in against the second it was timed for
+(the same second: another bot got to the sequencer first; a later one: the timing).
 
 These figures were checked to the unit against a real Loopback liquidation (block 84,602,814): the bot's repaid and
 seized amounts equal the Liquidate event's.
@@ -151,7 +152,9 @@ QuickNode's wss:// address is filled in from its https:// one; others go in Sett
 **The oracle, read ahead.** Between swaps NET's TWAP drifts toward the pool's price second by second, so the oracle's
 price a minute out is already known. When a loan is near the line the bot also reads it 30, 60 and 90 s ahead (an
 `eth_call` with a block-time override, in the same batch) and times its bid to the second interest and that drift tip
-the loan over. A node that doesn't take overrides leaves timed bids on interest alone.
+the loan over. The drift curves (fastest right after a swap), so a straight line between those reads lands a second or
+two late: within 20 s of a crossing the bot reads the oracle at each of the 6 seconds before it and takes the exact
+second. A node that doesn't take overrides leaves timed bids on interest alone.
 
 Public endpoints (mainnet):
 

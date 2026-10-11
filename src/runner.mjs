@@ -101,17 +101,24 @@ export function senderOf(wallet, rpcUrl, { sequencerUrl = null, fetchImpl = fetc
     nonce: () => each((x, p) => p.getTransactionCount(wallet.address, 'pending')),
     send: async (tx) => {
       const pop = await each((x) => x.populateTransaction({ ...tx, chainId: CHAIN_ID }));
-      const raw = await signers[0].signTransaction(pop), hash = keccak256(raw);
-      const tries = providers.map((p) => p.broadcastTransaction(raw).then(() => 'rpc'));
-      if (sequencerUrl) tries.push(toSequencer(raw).then(() => 'sequencer'));
-      try {
-        const first = await Promise.any(tries);
-        log?.debug?.(`tx ${hash.slice(0, 10)}… accepted first by the ${first}`);
-      } catch (e) { throw e.errors?.[0] ?? e; }   // all refused: the RPC's reason (nonce, funds) is the clearest
-      for (const t of tries) t.catch(() => null);
-      return { hash, wait: () => waitFor(hash) };
+      return broadcast(await signers[0].signTransaction(pop));
     },
+    // a timed bid: signed when it is built (every field set, nothing looked up), broadcast at its second
+    sign: (tx) => signers[0].signTransaction({ ...tx, chainId: CHAIN_ID, from: wallet.address }),
+    sendRaw: (raw) => broadcast(raw),
   };
+  // to every node and the sequencer at once: the first to accept it wins (it can only land once)
+  async function broadcast(raw) {
+    const hash = keccak256(raw);
+    const tries = providers.map((p) => p.broadcastTransaction(raw).then(() => 'rpc'));
+    if (sequencerUrl) tries.push(toSequencer(raw).then(() => 'sequencer'));
+    try {
+      const first = await Promise.any(tries);
+      log?.debug?.(`tx ${hash.slice(0, 10)}… accepted first by the ${first}`);
+    } catch (e) { throw e.errors?.[0] ?? e; }   // all refused: the RPC's reason (nonce, funds) is the clearest
+    for (const t of tries) t.catch(() => null);
+    return { hash, wait: () => waitFor(hash) };
+  }
 }
 
 export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = senderOf }) {

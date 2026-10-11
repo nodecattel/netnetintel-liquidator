@@ -85,3 +85,61 @@ test('dust: a loan owing under a cent (no collateral left) is not liquidatable n
   assert.equal(lines.some((l) => /skipped|liquidatable/.test(l)), false, lines.join('\n'));
   assert.equal(events.some((e) => e.kind === 'nofunds'), false);
 });
+
+test('the crossing second comes from the oracle read second by second, not the straight line between reads 30 s apart', async () => {
+  // between swaps the TWAP curves toward the pool's price, fastest at first: 3% under over ~10 s (e^-0.3t)
+  const priceAtT = (t) => { const x = Math.max(0, t - TS); return (PRICE * BigInt(Math.round((0.97 + 0.03 * Math.exp(-0.3 * x)) * 1e9))) / 1_000_000_000n; };
+  // the line sits 1.3% under today's price: the curve crosses it at +2 s, the straight line from +0 to +30 s at ~+13 s
+  const debt = toAssetsUp(shares, accrue(market, RATE, TS + 2).totalBorrowAssets, market.totalBorrowShares);
+  POS[BAD] = [0n, shares, (debt * WAD * ORACLE_PRICE_SCALE) / ((PRICE * 987n / 1000n) * LLTV) + 1n];
+  delete POS[GOOD];
+  const { rpc: base } = fakeRpc({ usdg: 10_000n * 10n ** 6n, allowance: 10_000n * 10n ** 6n });
+  const reads = [];
+  const rpc = async (calls) => {
+    const out = await base(calls);
+    return calls.map((c, i) => {
+      const o = c.params?.[3]?.time;
+      if (c.method !== 'eth_call' || o == null) return out[i];
+      const t = parseInt(o, 16); reads.push(t);
+      return { result: '0x' + priceAtT(t).toString(16).padStart(64, '0') };
+    });
+  };
+  rpc.one = base.one;
+  const sent = [];
+  let signed = 0;
+  const sender = { address: getAddress('0x1111111111111111111111111111111111111111'), nonce: async () => 3, estimateGas: async () => 300_000n,
+    sign: async (tx) => { signed++; return '0xraw' + tx.nonce; },
+    send: async () => { throw new Error('a timed bid is broadcast as signed, not signed again'); },
+    sendRaw: async (raw) => { sent.push({ raw, at: Date.now() }); return { hash: '0x' + 'a'.repeat(64), wait: async () => ({ status: 1, blockNumber: 1, logs: [] }) }; } };
+  const bot = makeBot({ rpc, sender, cfg, store: memStore(), log: quiet });
+  await bot.start();
+  await bot.tick();                                  // the first check sets the chain clock; the next reads ahead
+  const t0 = Date.now();
+  await bot.tick();
+  assert.ok(reads.some((t) => t > TS + 1 && t < TS + 13 && t !== TS + 30), `read second by second near the crossing: ${[...new Set(reads)].sort().map((t) => t - TS)}`);
+  await new Promise((r) => setTimeout(r, 3200));
+  assert.equal(sent.length, 1, 'the bid went out at the curve\'s crossing (+2 s), not the straight line\'s (+13 s)');
+  assert.ok(sent[0].at - t0 >= 1500 && sent[0].at - t0 <= 3000, `sent ${sent[0].at - t0} ms after the check`);
+  assert.equal(signed, 1, 'signed once, when it was built'); assert.equal(sent[0].raw, '0xraw3');
+});
+
+test('mergePoints: one price per second (the exact read wins), in time order', async () => {
+  const { mergePoints } = await import('../src/bot.mjs');
+  assert.deepEqual(mergePoints([{ t: 5, price: 1n }, { t: 1, price: 9n }], [{ t: 5, price: 2n }]), [{ t: 1, price: 9n }, { t: 5, price: 2n }]);
+});
+
+test('the sender signs a timed bid offline and broadcasts it as signed (to the sequencer too)', async () => {
+  const { Wallet, Transaction, keccak256 } = await import('ethers');
+  const { senderOf } = await import('../src/runner.mjs');
+  const { CHAIN_ID } = await import('../src/constants.mjs');
+  const w = Wallet.createRandom();
+  const posted = [];
+  const fetchImpl = async (url, init) => { posted.push({ url, body: JSON.parse(init.body) }); return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' })); };
+  const s = senderOf(w, 'https://127.0.0.1:9/', { sequencerUrl: 'https://sequencer.example/', fetchImpl });
+  const raw = await s.sign({ to: MORPHO, data: '0x12', gasLimit: SHOT_GAS, nonce: 5, type: 2, maxFeePerGas: 40_000_000n, maxPriorityFeePerGas: 0n });
+  const tx = Transaction.from(raw);
+  assert.equal(tx.from, w.address); assert.equal(tx.nonce, 5); assert.equal(tx.chainId, BigInt(CHAIN_ID)); assert.equal(tx.gasLimit, SHOT_GAS);
+  const r = await s.sendRaw(raw);
+  assert.equal(r.hash, keccak256(raw));
+  assert.equal(posted[0].body.method, 'eth_sendRawTransaction'); assert.equal(posted[0].body.params[0], raw);
+});

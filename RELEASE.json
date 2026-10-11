@@ -1,6 +1,6 @@
 {
-  "version": "1.5.1",
+  "version": "1.6.0",
   "date": "2026-10-11",
   "urgent": false,
-  "note": "Faster bids: a live feed over your RPC's wss:// address, timed bids that follow the TWAP's drift, and update notices on the page and in Telegram."
+  "note": "Timed bids land on the right second: the oracle is read second by second near a crossing (the old straight-line estimate fired 1-2 s late), and the bid is signed ahead and sent without waiting behind other transactions."
 }

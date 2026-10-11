@@ -5,7 +5,7 @@
 //   (or, from the withdraw command, the address the owner types).
 import { getAddress, MaxUint256, AbiCoder, keccak256 } from 'ethers';
 import { MORPHO, MARKET_ID, MARKET_FROM_BLOCK, MARKET_PARAMS, USDG, WSNET, EXPLORER_TX } from './constants.mjs';
-import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, readWallet, scanBorrowers, simulate } from './chain.mjs';
+import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, readWallet, readPricesAt, scanBorrowers, simulate } from './chain.mjs';
 import { accrue, positionView, planBid, crossingAt, pricePath, fmtUsdg, fmtWs } from './math.mjs';
 
 // Interest keeps accruing between the read and the block the bid lands in: bids are sized (and approvals set) on the
@@ -41,6 +41,12 @@ const SHOT_LAG_MS = 120;            // after the chain clock reaches the second:
 const CLOCK_SAMPLES = 30;
 // with a loan this close to the line (or a timed bid waiting), each check also reads the oracle's price AHEAD_SEC out
 export const AHEAD_HEALTH = 1.03, AHEAD_SEC = [30, 60, 90];
+// …and once a crossing is due within REFINE_SEC, the oracle at each of the REFINE_BACK seconds before it: the TWAP curves
+// toward the pool's price (fastest at first), so the straight line between reads 30 s apart lands the bid a second or two
+// after the loan crossed (11 Oct: a flash liquidator took 0x5634… at second 331; our bid, timed from the line, at 333).
+export const REFINE_SEC = 20, REFINE_BACK = 6;
+// several price points for one second (a read ahead and an exact one): the exact one, once; sorted by time
+export const mergePoints = (...lists) => [...new Map(lists.flat().filter(Boolean).map((p) => [p.t, p])).values()].sort((a, b) => a.t - b.t);
 
 // Wallet balances: units per token, the smallest change worth a word, and how a change is shown
 export const TOKENS = { eth: { dec: 18, dust: 10n ** 12n, sym: 'ETH' }, usdg: { dec: 6, dust: 10_000n, sym: 'USDG' }, wsnet: { dec: 18, dust: 10n ** 12n, sym: 'wsNET' },
@@ -208,19 +214,22 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   }
 
   // ---- every transaction the bot sends goes through here: the terminal, the page's Transactions and Telegram see it ----
-  function sendTx(kind, tx, note, { check = null } = {}) {
+  // A timed bid goes direct: its nonce was taken when it was built, and it must not wait behind another transaction's
+  // receipt (an approval, a payout) while its second passes.
+  function sendTx(kind, tx, note, { check = null, raw = null, direct = false } = {}) {
+    if (direct) return sendOne(kind, tx, note, check, raw);
     const run = sending.then(() => sendOne(kind, tx, note, check));
     sending = run.catch(() => null);
     return run;
   }
-  async function sendOne(kind, tx, note, check) {
+  async function sendOne(kind, tx, note, check, raw = null) {
     if (!sender) throw new Error('the wallet is locked');
     if (check) check();                                  // re-checked when its turn comes: paused or dry run since → not sent
     own.pending++; own.open = true; own.until = nowMs() + OWN_MAX_MS; own.settleBlock = null;   // settled by this one's block, not an earlier one's
     const rec = { at: new Date(nowMs()).toISOString(), kind, note, status: 'pending', hash: null };
     try {
       let sent;
-      try { sent = await sender.send(tx); }
+      try { sent = raw && sender.sendRaw ? await sender.sendRaw(raw) : await sender.send(tx); }
       catch (e) { rec.status = 'failed'; rec.error = String(e.shortMessage || e.message).slice(0, 200); store.recordTx?.(rec); log.warn(`tx ${kind} not sent: ${note} (${rec.error})`); emit({ kind: 'tx', tx: { ...rec } }); throw e; }
       rec.hash = sent.hash; store.recordTx?.(rec);
       log.info(`tx ${kind} sent: ${note} · ${EXPLORER_TX}${sent.hash}`);
@@ -410,14 +419,41 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     const live = liveNow() && me && rate != null && rate > 0n;
     const keep = new Set();
     // interest, and the oracle's drift: between swaps the TWAP moves toward the pool's price second by second
-    const priceAt = view.priceAhead ? pricePath([{ t: nowSec, price: view.price }, ...view.priceAhead]) : null;
+    const ahead = view.priceAhead ? mergePoints([{ t: nowSec, price: view.price }], view.priceAhead) : null;
+    let priceAt = ahead ? pricePath(ahead) : null;
     if (live) {
       let budget = spend?.usdg == null ? 0n : spend.usdg - cfg.reserve;
       if (cfg.maxRepay != null && budget > cfg.maxRepay) budget = cfg.maxRepay;
+      const due = [];
       for (const [b, pos] of view.positions) {
         if (!(pos.borrowShares > 0n) || (debts.get(b) ?? 0n) < DUST_DEBT || (cooldown.get(b) ?? 0) > now) continue;
         const at = crossingAt(pos, view.market, rate, view.price, params.lltv, nowSec, SHOT_WINDOW_SEC, priceAt);
-        if (at == null) continue;
+        if (at != null) due.push({ b, pos, at });
+      }
+      // close to a crossing: the oracle read at each second before it (one round trip for every loan due), then the
+      // crossing found again on those exact prices
+      let near = priceAt ? due.filter((d) => d.at - nowSec <= REFINE_SEC) : [];
+      let points = ahead;
+      const read = new Set();
+      for (let pass = 0; pass < 3 && near.length; pass++) {
+        const want = (d) => Array.from({ length: REFINE_BACK + 1 }, (_, i) => d.at - REFINE_BACK + i).filter((t) => t > nowSec);
+        const times = [...new Set(near.flatMap(want))].filter((t) => !read.has(t)).sort((a, b) => a - b).slice(0, 32);
+        if (!times.length) break;
+        const exact = await readPricesAt(rpc, params.oracle, times).catch(() => null);
+        if (!exact) { once('refine', 3_600_000, () => log.info('this RPC did not read the oracle second by second: timed bids follow the coarser estimate')); break; }
+        for (const t of times) read.add(t);
+        points = mergePoints(points, exact);
+        priceAt = pricePath(points);
+        for (const d of near) {
+          const was = d.at;
+          d.at = crossingAt(d.pos, view.market, rate, view.price, params.lltv, nowSec, SHOT_WINDOW_SEC, priceAt);
+          if (d.at != null && d.at !== was) dbg(`${short(d.b)}: the oracle read second by second puts the crossing at ${d.at} (${d.at - was > 0 ? '+' : ''}${d.at - was} s from the earlier estimate)`);
+        }
+        // a crossing at the first second read may be earlier still: read the seconds before it
+        near = near.filter((d) => d.at != null && d.at - 1 > nowSec && !read.has(d.at - 1));
+      }
+      for (const { b, pos, at } of due) {
+        if (at == null) continue;                                  // past the line already: the normal check bids
         const plan = planBid(pos, accrue(view.market, rate, at + 30), priceAt ? priceAt(at) : view.price, params.lltv, budget > 0n ? budget : 0n, { allowPartial: cfg.allowPartial });
         if (plan.skip || plan.profit < cfg.minProfit) continue;
         keep.add(b);
@@ -436,8 +472,11 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       const gp = view.gasPrice ?? 0n;
       const tx = { to: MORPHO, data: MORPHO_IFACE.encodeFunctionData('liquidate', [paramsTuple(params), borrower, plan.args.seizedAssets, plan.args.repaidShares, '0x']),
         gasLimit: SHOT_GAS, nonce, type: 2, maxFeePerGas: gp > 0n ? gp * 2n : undefined, maxPriorityFeePerGas: 0n };
+      // signed now, so at the second it only has to be broadcast (no fee or nonce lookups, no signing on the clock)
+      let raw = null;
+      if (sender.sign && tx.maxFeePerGas != null) try { raw = await sender.sign(tx); } catch { raw = null; }
       const wait = Math.max(0, (at - chainOffset()) * 1000 + SHOT_LAG_MS - nowMs());
-      const shot = { at, plan, nonce, timer: null };
+      const shot = { at, plan, nonce, timer: null, raw };
       shot.timer = setTimeout(() => { fire(borrower, shot, tx).catch(() => null); }, wait);
       shots.set(borrower, shot);
       once(`armed:${borrower}:${at}`, 600_000, () => log.info(`${short(borrower)} crosses the line in ${Math.round(wait / 1000)} s (interest${view.priceAhead ? ' and the oracle\'s drift' : ''}): a ${plan.mode} bid (repay ${fmtUsdg(plan.repaid)} USDG, +${fmtUsdg(plan.profit)}) goes out at that second`));
@@ -453,7 +492,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     cooldown.set(borrower, now + 15_000);                          // the 2 s check leaves it to this bid
     const what = `timed ${shot.plan.mode} bid on ${short(borrower)}: repay ${fmtUsdg(shot.plan.repaid)} USDG, seize ${fmtWs(shot.plan.seized)} wsNET (+${fmtUsdg(shot.plan.profit)})`;
     let r;
-    try { r = await sendTx('liquidate', tx, what, { check: needLive }); }
+    try { r = await sendTx('liquidate', tx, what, { check: needLive, raw: shot.raw, direct: true }); }
     catch (e) {
       // usually the nonce moved (another transaction went first): the next check bids the normal way
       cooldown.delete(borrower);
@@ -464,8 +503,14 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     if (!r.receipt) return;                                        // unconfirmed: the transaction list shows it
     const n = (lostRow.get(borrower) ?? 0) + 1;
     lostRow.set(borrower, n);
-    lostSince.push({ borrower, at: now, block: r.receipt.blockNumber != null ? Number(r.receipt.blockNumber) : null });
-    log.info(`${short(borrower)}: lost the race (the bid reverted: someone was first, or the price moved)${n >= LOST_MAX ? ` · ${n} in a row: leaving it for ${LOST_PAUSE_MS / 60_000} min` : ''}`);
+    // which chain second it landed in, against the one it was timed for: a later second means the timing, the same
+    // second means another bot reached the sequencer first within it
+    const block = r.receipt.blockNumber != null ? Number(r.receipt.blockNumber) : null;
+    let landed = null;
+    if (block != null) try { landed = parseInt((await rpc.one('eth_getBlockByNumber', ['0x' + block.toString(16), false])).timestamp, 16); } catch { /* unread */ }
+    lostSince.push({ borrower, at: now, block, planned: shot.at, landed });
+    const when = landed == null ? '' : landed === shot.at ? ` in the second it was timed for (${landed}): another bot reached the sequencer first` : ` ${landed - shot.at} s ${landed > shot.at ? 'after' : 'before'} the second it was timed for (${shot.at})`;
+    log.info(`${short(borrower)}: lost the race (the bid reverted${when || ': someone was first, or the price moved'})${n >= LOST_MAX ? ` · ${n} in a row: leaving it for ${LOST_PAUSE_MS / 60_000} min` : ''}`);
     if (n >= LOST_MAX) { cooldown.set(borrower, now + LOST_PAUSE_MS); lostRow.delete(borrower); }
   }
   function racesReport(now) {
