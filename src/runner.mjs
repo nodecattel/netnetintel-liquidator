@@ -1,9 +1,9 @@
 // The running bot: the liquidation loop, its wallet (locked until the owner logs in to the local page, unless they
 // chose otherwise), the owner's settings, and the Telegram link. server.mjs calls the methods below; nothing here is
 // reachable from outside the owner's machine except the relay's own outbound calls.
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { JsonRpcProvider, FetchRequest, Wallet, getAddress, keccak256 } from 'ethers';
-import { randomInt } from 'node:crypto';
+import { randomInt, randomBytes } from 'node:crypto';
 import { CHAIN_ID, USDG, WSNET, NET, SNET, EXPLORER_TX, PUBLIC_RPC, PUBLIC_SEQUENCER, PUBLIC_FEED, PUBLIC_FEED_DELAYED, RPC_PROVIDERS, INTEL_API } from './constants.mjs';
 import { configFrom } from './config.mjs';
 import { makeRpc, ERC20 } from './chain.mjs';
@@ -16,6 +16,30 @@ import { makeRelay, TOKEN_RE } from './relay.mjs';
 import { fmtUsdg, fmtWs } from './math.mjs';
 
 export const VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+
+// One copy sends from a wallet at a time. Two copies sharing the same /data (one started by hand next to the starter's,
+// say) race each other's nonces and bids: the newest started takes over and the older one pauses. It writes
+// /data/instance.json every LOCK_BEAT_MS; an older copy that finds a newer one there (with a beat in the last
+// LOCK_STALE_MS) stops sending, and takes over again if that one goes quiet. Copies on other machines with the same
+// Telegram link are told apart by NetNet Intel's relay the same way (relay.mjs: superseded).
+export const LOCK_BEAT_MS = 10_000, LOCK_STALE_MS = 60_000;
+export function makeInstanceLock(dataDir, { id = randomBytes(6).toString('hex'), startedAt = Date.now(), now = () => Date.now() } = {}) {
+  const file = `${dataDir}/instance.json`;
+  let lastBeat = 0;
+  const read = () => { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; } };
+  return {
+    id, startedAt,
+    /** true while a newer copy holds the lock; otherwise claims (or keeps) it */
+    check() {
+      const t = now(), cur = read();
+      if (cur && cur.id !== id && Number(cur.startedAt) > startedAt && t - Number(cur.beat || 0) < LOCK_STALE_MS) return true;
+      if (!cur || cur.id !== id || t - lastBeat >= LOCK_BEAT_MS) {
+        try { writeFileSync(file + '.tmp', JSON.stringify({ id, startedAt, beat: t, v: VERSION })); renameSync(file + '.tmp', file); lastBeat = t; } catch { /* a read-only /data: no lock */ }
+      }
+      return false;
+    },
+  };
+}
 const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 export const httpErr = (status, message) => Object.assign(new Error(message), { status });
 
@@ -102,7 +126,10 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
   const intel = makeIntel({ base: intelBase(env), version: VERSION, fetchImpl });
   const store = makeStore(dataDir);
   const notify = makeNotify(env, log, fetchImpl);
-  const relay = makeRelay({ getToken: () => settings.get().relayToken || null, version: VERSION, fetchImpl, log: (m) => log.warn(m) });
+  const lock = makeInstanceLock(dataDir);
+  const relay = makeRelay({ getToken: () => settings.get().relayToken || null, version: VERSION, instance: { id: lock.id, startedAt: lock.startedAt }, fetchImpl, log: (m) => log.warn(m) });
+  // a newer copy of this liquidator is running: 'lock' (same storage, this computer) or 'relay' (same Telegram link)
+  let superseded = null;
   const events = [];   // the last events, for the local page
   const onEvent = (e) => {
     const ev = { ...e, at: typeof e.at === 'number' ? e.at : Date.now() };   // a liquidation's record carries its ISO time: the event keeps a number
@@ -138,7 +165,15 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     if (wallet && cfg.rpcUrl !== before) { sender = newSender(wallet); bot.setSender(sender); log.info(`RPC changed to ${cfg.rpcUrl}`); }
   }
   const localPaused = () => !!settings.get().paused;
-  const syncPause = () => bot.setPaused(localPaused() || relay.paused || withdrawing);
+  const checkCopies = () => {
+    const was = superseded;
+    superseded = lock.check() ? 'lock' : relay.superseded ? 'relay' : null;
+    if (superseded && !was) {
+      log.warn(`another copy of this liquidator started after this one (${superseded === 'lock' ? 'same wallet storage on this computer' : 'same Telegram link, another machine'}): this copy stops sending so the two don't race. Stop one of them; this one takes over again if the other goes quiet`);
+      if (superseded === 'lock') onEvent({ kind: 'superseded', by: 'lock' });   // the relay tells Telegram itself
+    } else if (!superseded && was) log.info('the newer copy went quiet: this copy is sending again');
+  };
+  const syncPause = () => { checkCopies(); bot.setPaused(localPaused() || relay.paused || withdrawing || !!superseded); };
   syncPause();
 
   // ---- the loop: start (retrying while the RPC is down), then tick; the Telegram link rides along ----
@@ -193,7 +228,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     const st = bot.status(), dayAgo = Date.now() - 86400e3;
     const day = store.history().filter((h) => Date.parse(h.at) > dayAgo);
     return {
-      v: VERSION, live: st.live, liveNow: st.liveNow, paused: st.paused, locked: locked(), oraclePaused: st.oraclePaused,
+      v: VERSION, live: st.live, liveNow: st.liveNow, paused: st.paused, locked: locked(), oraclePaused: st.oraclePaused, superseded,
       usdg: st.wallet?.usdg ?? null, eth: st.wallet?.eth ?? null, wsnet: st.wallet?.wsnet ?? null, net: st.wallet?.net ?? null, snet: st.wallet?.snet ?? null,
       open: st.open, hot: st.hot, ready: st.ready, closest: st.closest[0]?.health ?? null,
       liq24h: day.length, repaid24h: Number(day.reduce((a, h) => a + Number(h.repaid || 0), 0).toFixed(2)), error: st.lastError,
@@ -236,7 +271,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     state() {
       const saved = settings.get(), { fixed } = derived();
       return {
-        version: VERSION,
+        version: VERSION, superseded,
         wallet: { address: wallet?.address ?? pending?.address ?? null, source: walletSource, locked: locked(), backedUp: walletSource === 'env' || !!saved.backedUp,
           pendingBackup: !!pending, exists: keySource(keyEnv).kind !== 'none' },
         settings: {

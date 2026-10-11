@@ -89,6 +89,20 @@ on Telegram and in the feed.
 These figures were checked to the unit against a real Loopback liquidation (block 84,602,814): the bot's repaid and
 seized amounts equal the Liquidate event's.
 
+## One copy at a time
+
+Two copies of the bot would race each other for the same loans (and, on one wallet, for the same nonce). So:
+
+- **The start command keeps exactly one.** Before starting the latest image it stops and removes every liquidator
+  container on the computer: any name, any version, ones made with docker compose or built from this folder. Their
+  storage is never deleted; a copy with its own wallet gets its address printed and the command to open it again to
+  withdraw. Something outside Docker on port 8788 (a copy started from the source) is named, and the command stops
+  there until it is closed.
+- **Inside the bot, the newest copy wins.** Copies sharing one storage take turns through a lock file (`/data/instance.json`),
+  and live copies on different machines with the same Telegram link are told apart by NetNet Intel. The newest keeps
+  sending; an older one pauses itself, says why on its page, and takes over again if the newer one stops. A dry-run
+  copy never pauses a live one.
+
 ## Good to know
 
 - **The oracle guard.** While the NET/USDG pool sits more than 15% under the TWAP, the Loopback oracle holds

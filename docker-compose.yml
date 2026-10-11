@@ -5,6 +5,7 @@ services:
     image: ghcr.io/nodecattel/netnetintel-liquidator:latest
     # build: .              # or build from this folder
     container_name: netnet-liq
+    labels: { org.netnetintel.liquidator: "1" }   # the start command finds (and replaces) it by this
     restart: unless-stopped
     ports:
       - "127.0.0.1:8788:8788"   # this computer only: don't drop the 127.0.0.1

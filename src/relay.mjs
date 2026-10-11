@@ -6,9 +6,9 @@ export const RELAY_URL = 'https://netnetintel.com/functions/liquidatorRelay';
 export const TOKEN_RE = /^nnlq_[A-Za-z0-9_-]{40,60}$/;
 const MAX_QUEUE = 30;
 
-export function makeRelay({ getToken, url = RELAY_URL, version, fetchImpl = fetch, log = () => {} }) {
+export function makeRelay({ getToken, url = RELAY_URL, version, instance = null, fetchImpl = fetch, log = () => {} }) {
   const queue = [];
-  let lastError = null, pause = false, lastPoll = 0, pollSec = 60, revoked = false;
+  let lastError = null, pause = false, lastPoll = 0, pollSec = 60, revoked = false, superseded = false;
   async function post(body) {
     const token = getToken();
     const res = await fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, v: version, ...body }), signal: AbortSignal.timeout(15000) });
@@ -20,6 +20,8 @@ export function makeRelay({ getToken, url = RELAY_URL, version, fetchImpl = fetc
   }
   return {
     get paused() { return pause; },
+    // NetNet Intel saw a newer copy check in with the same link: this one stands down (sticks until a poll says otherwise)
+    get superseded() { return superseded; },
     get lastError() { return lastError; },
     get revoked() { return revoked; },
     get linked() { return !!getToken(); },
@@ -35,11 +37,11 @@ export function makeRelay({ getToken, url = RELAY_URL, version, fetchImpl = fetc
       if (!getToken() || (!force && now - lastPoll < pollSec * 1000)) return null;
       lastPoll = now;
       try {
-        const j = await post({ action: 'poll', status });
-        pause = !!j.pause; pollSec = Math.min(300, Math.max(20, Number(j.pollSec) || 60)); lastError = null;
+        const j = await post({ action: 'poll', status, ...(instance ? { inst: instance } : {}) });
+        pause = !!j.pause; superseded = !!j.superseded; pollSec = Math.min(300, Math.max(20, Number(j.pollSec) || 60)); lastError = null;
         return j;
       } catch (e) { lastError = e.message; return null; }
     },
-    forget() { queue.length = 0; pause = false; revoked = false; lastError = null; lastPoll = 0; },
+    forget() { queue.length = 0; pause = false; superseded = false; revoked = false; lastError = null; lastPoll = 0; },
   };
 }

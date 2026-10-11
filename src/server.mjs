@@ -55,8 +55,9 @@ export function startServer({ runner, port = 8788, host = '0.0.0.0', allowedHost
 
   const routes = {
     'GET /api/state': async (_r, _b, authed) => {
-      if (!api.hasPassword()) return { auth: 'setup', exists: api.state().wallet.exists };
-      if (!authed) return { auth: 'login' };
+      // the version is public (the start command prints it); nothing else is before login
+      if (!api.hasPassword()) { const st = api.state(); return { auth: 'setup', exists: st.wallet.exists, v: st.version }; }
+      if (!authed) return { auth: 'login', v: api.state().version };
       return { auth: 'ok', ...api.state() };
     },
     'POST /api/password': async (_r, b) => { const ok = limit(); await api.setupPassword(b.password); ok(); return { ok: true, login: true }; },

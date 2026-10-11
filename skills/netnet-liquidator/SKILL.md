@@ -92,5 +92,7 @@ After a restart the wallet stays locked until they log in on the page (Telegram 
 - "RPC problem" or balances not showing: the page says what the RPC answered. The public Robinhood Chain RPC is shared and rate-limited; the user can paste their own (Chainstack, QuickNode, Blockdaemon, dRPC, Validation Cloud, GlobalStake) in Settings → Speed. That needs their page password, so it's their step.
 - "NetNet Intel API not reachable" in the log: harmless. The bot finds the loans on chain instead (a minute on the public RPC).
 - Telegram link lost: make a new code with /liquidator and paste it in Settings → Telegram.
+- "Another copy of this liquidator started after this one": two copies are running (two containers, or one here and one on a server with the same Telegram link). The older one pauses itself. Running the start command again keeps exactly one on this computer; a copy on another machine has to be stopped there.
+- "Port 8788 is still in use" from the start command: a copy started from the source code (npm start / node src/main.mjs) is still running. The user stops it (Ctrl+C in its terminal), then runs the start command again.
 
 Source and full README: https://github.com/nodecattel/netnetintel-liquidator

@@ -302,6 +302,7 @@ function feedLine(e) {
     case 'outflow': return ['bad', `${amt(e.amount)} ${e.token} left the wallet, not sent by the bot`];
     case 'liquidated': return ['ok', `Liquidated ${b(e.borrower)}: repaid ${e.repaid} USDG, seized ${e.seized} wsNET (+${e.profitAtOracle})`];
     case 'missed': return ['', `Missed ${b(e.borrower)}: another liquidator got there first`];
+    case 'superseded': return ['bad', 'A newer copy of this liquidator took over: this one sends nothing'];
     case 'races': return ['', `Lost ${e.lost} timed bid${e.lost === 1 ? '' : 's'} in the last hour (${(e.borrowers || []).map((x) => `${b(x.borrower)} ×${x.n}`).join(', ')}): another bot landed first`];
     case 'failed': return ['bad', `Attempt on ${b(e.borrower)} failed: ${e.error}`];
     case 'dry': return ['', `${e.paused ? 'Paused' : 'Dry run'}: would liquidate ${b(e.borrower)} (repay ${e.repaid} USDG, +${e.profit})`];
@@ -382,6 +383,7 @@ function dashboard() {
     s.live && lowGas ? '<div class="note bad">Live, but out of ETH for gas: it can\'t send anything until you top it up. <a href="#" id="tofund">How to fund it</a></div>' : '',
     s.live && noUsdg ? '<div class="note warn">Live, but the wallet has no USDG to liquidate with. <a href="#" id="tofund2">How to fund it</a></div>' : '',
     t.paused ? '<div class="note warn">Paused from Telegram: resume it from /liquidator.</div>' : '',
+    S.superseded ? `<div class="note bad">Another copy of this liquidator started after this one (${S.superseded === 'lock' ? 'on this computer, same wallet' : 'on another machine, same Telegram link'}), so this copy sends nothing: two would race each other. Stop one of them. Run the start command again to keep just the newest here.</div>` : '',
     flash ? `<div class="note ok">${esc(flash)}</div>` : '',
   ].join('');
   flash = '';

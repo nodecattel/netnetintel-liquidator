@@ -1,5 +1,7 @@
 # NetNet Loopback liquidator. Build: docker build -t netnetintel-liquidator .
 FROM node:22-alpine
+# the start command finds every liquidator container by this label, so only one ever runs on a computer
+LABEL org.netnetintel.liquidator="1"
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
