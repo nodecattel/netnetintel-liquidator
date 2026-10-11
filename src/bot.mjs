@@ -5,8 +5,8 @@
 //   (or, from the withdraw command, the address the owner types).
 import { getAddress, MaxUint256, AbiCoder, keccak256 } from 'ethers';
 import { MORPHO, MARKET_ID, MARKET_FROM_BLOCK, MARKET_PARAMS, USDG, WSNET, EXPLORER_TX } from './constants.mjs';
-import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, readWallet, readPricesAt, scanBorrowers, simulate } from './chain.mjs';
-import { accrue, positionView, planBid, crossingAt, pricePath, fmtUsdg, fmtWs } from './math.mjs';
+import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, readWallet, readPricesAt, scanBorrowers, scanMarket, simulate } from './chain.mjs';
+import { accrue, positionView, planBid, crossingAt, pricePath, incentiveOf, WAD, fmtUsdg, fmtWs } from './math.mjs';
 
 // Interest keeps accruing between the read and the block the bid lands in: bids are sized (and approvals set) on the
 // debt as it will be HEADROOM_SEC from now, so the USDG Morpho pulls never exceeds what was planned or approved.
@@ -14,7 +14,19 @@ const HEADROOM_SEC = 60;
 // Borrowers are scanned up to a few blocks behind the head, so a logs node that is a block or two behind can't make
 // the cursor skip a Borrow it hasn't indexed yet.
 const LOG_LAG = 5;
-const DISCOVER_MS = 15_000, EVERYONE_MS = 10 * 60_000;
+// The pace. A loan's health only changes three ways: interest (known ahead, worked out here), the oracle's price (one
+// read per check, whatever the number of loans) and the loan itself, which only changes through an event on the market
+// (borrow, repay, collateral in or out, liquidation). So each loan is read once, then again only when an event names
+// it; between events its health follows from the price and the interest. A slow sweep re-reads every wallet in turn
+// as a safety net, loans under HOT_HEALTH are re-read every HOT_EVERY_MS and loans about to cross on every check.
+// How often the bot checks follows how close the closest loan is: CALM_MS while every loan is well clear, WATCH_MS
+// once one is under HOT_HEALTH or the oracle has fallen FALL_WATCH in the last minute, every TICK_SECONDS when one is
+// within AHEAD_HEALTH of the line (or a timed bid is set). A swap, an oracle checkpoint or a market event on the live
+// feed checks at once, in any pace.
+export const PACE = { calmMs: 15_000, watchMs: 6_000 };
+export const WAKE_GAP_MS = { fast: 250, watch: 1_000, calm: 3_000 };   // the least time between two checks the live feed asks for
+const WALLET_EVERY_MS = 30_000, RATE_EVERY_MS = 60_000, HOT_EVERY_MS = 30_000, SWEEP_EVERY_MS = 30_000;
+export const SWEEP_N = 25, FRESH_PER_TICK = 60, FOLLOW_MAX_BLOCKS = 5_000, FALL_WATCH = 0.005;
 // What gas costs here: a liquidation uses about LIQ_GAS (Morpho's liquidate plus two token transfers; the 30% gas limit
 // margin is never charged), and the wallet's ETH covers this many of them at today's price.
 export const LIQ_GAS = 250_000n;
@@ -78,8 +90,11 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   // from each tick. At start the scan from `scanned` to the head runs in the background (`backfill`), so the bot
   // watches the loans it already knows (and NetNet Intel's list) from the first second.
   let scanned = store.cursor ?? MARKET_FROM_BLOCK - 1, cursor = scanned, backfill = null, backfillDone = false, backfillRetryAt = 0;
-  let lastDiscover = 0, lastEveryone = 0;
-  let rate = null, lastFull = 0, lastHead = null, pausedSince = null, lastSummary = 0, busy = false, ticks = 0;
+  let lastHot = 0, lastSweep = 0, lastWalletRead = 0, lastGasRead = 0, lastRate = 0, sweepOrder = [], sweepAt = 0;
+  const posCache = new Map();         // borrower → { borrowShares, collateral } as last read (loans with debt only)
+  const priceHist = [];              // [{ t, price }] over the last two minutes: is the oracle falling?
+  let pace = { mode: 'fast', ms: null, why: 'starting' };
+  let rate = null, lastHead = null, pausedSince = null, lastSummary = 0, busy = false, ticks = 0;
   let wallet = null, walletAt = null, walletBlock = 0, seen = null, walletLogged = false, backfillPromise = null;
   const own = { pending: 0, open: false, settleBlock: null, until: 0 };
   let sending = Promise.resolve();   // one transaction at a time: two at once could take the same nonce
@@ -96,6 +111,9 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   const clock = [];
   const chainOffset = () => (clock.length ? Math.max(...clock) : 0);
 
+  // a loan worth a bid: liquidated at the line it pays its debt × (incentive − 1); one that would earn under
+  // MIN_PROFIT_USDG (a few cents left after a partial liquidation) sets no pace and gets no extra reads
+  const worth = (b) => { const d = debts.get(b) ?? 0n, inc = incentiveOf(params?.lltv ?? MARKET_PARAMS.lltv); return (d * (inc - WAD)) / WAD >= cfg.minProfit; };
   const once = (key, everyMs, f) => { if (said.size > 2000) said.clear(); const t = said.get(key); if (t && nowMs() - t < everyMs) return; said.set(key, nowMs()); f(); };
   const saveScan = () => store.setScan(backfillDone ? cursor : scanned, [...known].filter((a) => !seededOnly.has(a) || health.has(a)));
   const loadSeen = () => { const w = store.walletSeen?.(); seen = w && me && w.address === me ? Object.fromEntries(Object.entries(w.bal).map(([k, v]) => [k, v == null ? null : BigInt(v)])) : null; };
@@ -122,6 +140,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
         if (added) saveScan();
       } catch (e) { log.warn(`NetNet Intel API not reachable (${e.message}): finding the loans on chain instead`); }
     }
+    for (const a of known) fresh.add(a);                       // every wallet once at the start (NetNet Intel's open loans first), then on events
     cursor = Math.max(cursor, head);
     if (scanned < head) startBackfill(scanned + 1, head);
     else { backfillDone = true; saveScan(); }
@@ -150,21 +169,37 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     });
   }
 
-  // new borrowers since the last look: one eth_getLogs over the blocks since
-  async function discover(readHead) {
+  // every event on the market since the last look (one eth_getLogs): new borrowers join, and every wallet an event
+  // names is read again on this check. A long gap (the first look, or the bot was down) takes the ranged Borrow scan.
+  async function follow(readHead) {
     if (readHead == null) return;
     try {
       let head = readHead;
       if (logsRpc !== rpc) head = Math.min(head, parseInt(await logsRpc.one('eth_blockNumber', []), 16));
       head -= LOG_LAG;
       if (head <= cursor) return;
-      const found = await scanBorrowers(logsRpc, cursor + 1, head, { range: Math.max(cfg.logRange, head - cursor), minRange: cfg.minLogRange });
       let added = 0;
-      for (const a of found) { seededOnly.delete(a); if (!known.has(a)) { known.add(a); added++; } fresh.add(a); }
+      const join = (a) => { seededOnly.delete(a); if (!known.has(a)) { known.add(a); added++; } fresh.add(a); };
+      if (head - cursor > FOLLOW_MAX_BLOCKS) {
+        for (const a of await scanBorrowers(logsRpc, cursor + 1, head, { range: Math.max(cfg.logRange, head - cursor), minRange: cfg.minLogRange })) join(a);
+        for (const a of health.keys()) fresh.add(a);                         // what happened meanwhile is unknown: read them all
+      } else {
+        const ev = await scanMarket(logsRpc, cursor + 1, head);
+        for (const a of ev.borrowers) join(a);
+        for (const a of ev.touched) if (known.has(a)) fresh.add(a);
+        if (ev.events) dbg(`market: ${ev.events} event${ev.events > 1 ? 's' : ''} in blocks ${cursor + 1}-${head}, ${ev.touched.size} wallet${ev.touched.size === 1 ? '' : 's'} named`);
+      }
       cursor = head;
       if (added) { saveScan(); log.info(`${added} new borrower${added > 1 ? 's' : ''}`); }
       else if (backfillDone && head - (store.cursor ?? 0) > 50_000) saveScan();   // keep the saved cursor near the head
-    } catch (e) { once('discover', 60_000, () => log.warn(`could not read new borrowers: ${e.message}`)); }
+    } catch (e) { once('discover', 60_000, () => log.warn(`could not read the market's events: ${e.message}`)); }
+  }
+  // the next wallets for the safety sweep: loans with debt first, then every wallet that ever borrowed, in turn
+  function sweepNext(n) {
+    if (sweepAt >= sweepOrder.length) { sweepOrder = [...known].sort((a, b) => Number(health.has(b)) - Number(health.has(a))); sweepAt = 0; }
+    const out = sweepOrder.slice(sweepAt, sweepAt + n);
+    sweepAt += n;
+    return out;
   }
 
   // ---- the wallet: balances for the page (a value that didn't read keeps the last good one), deposits, and funds that
@@ -259,32 +294,39 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     const now = nowMs(), t0 = Date.now();
     ticks++;
     if (!backfillDone && !backfill?.running && now >= backfillRetryAt && backfill) startBackfill(Math.max(scanned, backfill.at) + 1, cursor);
-    // new borrowers: every 15 s, not every tick (a fresh loan sits at the LTV it was opened at, not past the line)
-    if (now - lastDiscover >= DISCOVER_MS) { lastDiscover = now; await discover(lastHead); }
-    // every 30 s: each open loan; every 10 minutes: every wallet that ever borrowed (one may have borrowed again).
-    // Reading all ~800 every 30 s used up providers' per-second limits for nothing: most have no loan now.
-    const full = now - lastFull >= cfg.fullEverySeconds * 1000;
-    const everyone = now - lastEveryone >= EVERYONE_MS;
-    const list = everyone ? [...known]
-      : full ? [...known].filter((a) => fresh.has(a) || health.has(a))
-      : [...known].filter((a) => fresh.has(a) || (health.get(a) ?? Infinity) < cfg.hotHealth);
-    if (everyone) lastEveryone = now;
-    // the rate moves slowly: re-read with every full pass (and until a read succeeds)
-    const near = shots.size > 0 || [...health.values()].some((h) => h < AHEAD_HEALTH);
+    await follow(lastHead);
+    // what to read this check: new and event-named wallets, loans about to cross, and on their timers the loans under
+    // HOT_HEALTH and the sweep's next few
+    const near = shots.size > 0 || lastReady > 0 || [...health].some(([a, h]) => h < AHEAD_HEALTH && worth(a));
+    const want = new Set();
+    for (const a of fresh) { if (want.size >= FRESH_PER_TICK) break; want.add(a); }
+    for (const [a, h] of health) if (h < AHEAD_HEALTH && worth(a)) want.add(a);
+    if (now - lastHot >= HOT_EVERY_MS) { lastHot = now; for (const [a, h] of health) if (h < cfg.hotHealth) want.add(a); }
+    if (now - lastSweep >= SWEEP_EVERY_MS) { lastSweep = now; for (const a of sweepNext(SWEEP_N)) want.add(a); }
+    const list = [...want];
+    // the wallet and the gas price every 30 s (on every check while a bid may go out); the rate every minute
+    const rateDue = rate == null || now - lastRate >= RATE_EVERY_MS;
+    const walletDue = !!me && (near || own.pending > 0 || own.open || now - lastWalletRead >= WALLET_EVERY_MS);
+    const gasDue = near || lastView?.gasPrice == null || now - lastGasRead >= WALLET_EVERY_MS;
     const chainNow = Date.now() / 1000 + chainOffset();
     const ahead = near && clock.length ? AHEAD_SEC.map((d) => chainNow + d) : [];
-    const view = await readTick(rpc, params, me, list, { rate: full || rate == null ? null : rate, ahead });
+    const view = await readTick(rpc, params, walletDue ? me : null, list, { rate: rateDue ? null : rate, ahead, gas: gasDue });
     if (ahead.length && !view.priceAhead) once('ahead', 3_600_000, () => log.info('this RPC does not read the oracle ahead (block-time overrides): timed bids follow interest only'));
-    if (full || rate == null) rate = view.rate;
-    if (view.rate == null) once('rate', 600_000, () => log.warn('the interest rate did not read: debts are figured without the interest since the market last moved'));
-    if (full) lastFull = now;
-    fresh.clear();
+    if (rateDue) { if (view.rate != null) { rate = view.rate; lastRate = now; } }
+    if (rate == null) once('rate', 600_000, () => log.warn('the interest rate did not read: debts are figured without the interest since the market last moved'));
+    if (view.wallet) lastWalletRead = now;
+    if (view.gasPrice != null) lastGasRead = now;
+    for (const a of list) fresh.delete(a);
     lastHead = view.block?.number ?? lastHead;
-    const spend = view.wallet;                                // this tick's read: what bids and approvals use (unread → none)
+    let spend = view.wallet;                                  // this check's read: what bids and approvals use (unread → none)
     const wallet = trackWallet(view.wallet, view.block?.number ?? null);
-    lastView = { block: view.block, price: view.price, gasPrice: view.gasPrice };
+    lastView = { block: view.block, price: view.price, gasPrice: view.gasPrice ?? lastView?.gasPrice ?? null };
+    for (const [b, pos] of view.positions) {
+      if (pos.borrowShares === 0n) { posCache.delete(b); health.delete(b); debts.delete(b); }
+      else posCache.set(b, pos);
+    }
     const st = rpc.stats?.();
-    dbg(`tick ${ticks} · block ${view.block?.number?.toLocaleString('en-US') ?? '?'} · read ${list.length}${full ? ' (all)' : ''} loans in ${Date.now() - t0} ms${st ? ` · rpc ${st.host} ~${st.ms} ms${st.fallback ? ' (fallback)' : ''}` : ''}${view.price == null ? ' · oracle paused' : ''}`);
+    dbg(`tick ${ticks} · block ${view.block?.number?.toLocaleString('en-US') ?? '?'} · read ${list.length} of ${posCache.size} loans in ${Date.now() - t0} ms${st ? ` · rpc ${st.host} ~${st.ms} ms, ${st.perMin}/min, budget ${st.budget}/s${st.fallback ? ' (fallback)' : ''}` : ''}${view.price == null ? ' · oracle paused' : ''}`);
 
     if (view.price == null) {
       if (!pausedSince) { pausedSince = now; log.warn('the oracle is not giving a price (its guard holds while the pool sits more than 15% under the TWAP): no liquidations until it does'); notify('Loopback oracle paused: no liquidations until it gives a price again.'); emit({ kind: 'oracle', paused: true }); }
@@ -293,21 +335,20 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     if (pausedSince) { log.info('the oracle is giving a price again'); pausedSince = null; emit({ kind: 'oracle', paused: false }); }
 
     const nowSec = view.block?.timestamp ?? Math.floor(now / 1000);
-    const m = accrue(view.market, view.rate ?? 0n, nowSec);                    // as Morpho sees it now: who is past the line
-    const mPlan = accrue(view.market, view.rate ?? 0n, nowSec + HEADROOM_SEC); // as it may be when the bid lands: how much to repay
+    const m = accrue(view.market, rate ?? 0n, nowSec);                         // as Morpho sees it now: who is past the line
+    const mPlan = accrue(view.market, rate ?? 0n, nowSec + HEADROOM_SEC);      // as it may be when the bid lands: how much to repay
     const ready = [];
-    for (const [b, pos] of view.positions) {
+    for (const [b, pos] of posCache) {
       if (pos.borrowShares === 0n) { health.delete(b); debts.delete(b); continue; }
       const v = positionView(pos, m, view.price, params.lltv);
       if (v.debt < DUST_DEBT) { health.delete(b); debts.delete(b); continue; }
       health.set(b, v.health); debts.set(b, v.debt);
       if (v.liquidatable) ready.push({ borrower: b, pos, view: v });
     }
-    if (everyone) for (const b of known) if (!view.positions.has(b)) { health.delete(b); debts.delete(b); }
     if (view.block?.timestamp != null) { clock.push(view.block.timestamp - t0 / 1000); if (clock.length > CLOCK_SAMPLES) clock.shift(); }
-    await armShots(view, spend, nowSec, now);
+    await armShots({ ...view, positions: posCache }, spend, nowSec, now);
     racesReport(now);
-    lastReady = ready.length;
+    lastReady = ready.filter((r) => worth(r.borrower)).length;
     if (ready.length) dbg(`liquidatable: ${ready.map((r) => `${short(r.borrower)} ${(Math.floor(r.view.health * 1e4) / 1e4).toFixed(4)}`).join(', ')}`);
 
     if (cfg.live && me && wallet?.eth != null && wallet.eth < cfg.gasFloorWei) once('gas', 3_600_000, () => { log.warn(`the wallet has ${(Number(wallet.eth) / 1e18).toFixed(6)} ETH for gas: top it up`); notify(`Liquidator wallet ${short(me)} is low on ETH for gas.`); emit({ kind: 'gas', eth: Number(wallet.eth) / 1e18 }); });
@@ -318,7 +359,9 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
         once('approve-tg', 3_600_000, () => emit({ kind: 'approve_failed', error: String(e.shortMessage || e.message).slice(0, 140) }));   // live but unable to bid
       }
     };
+    setPace(now, view.price, ready.filter((r) => worth(r.borrower)).length);
     if (!ready.length) { await idle(); return { ready: 0 }; }
+    if (me && !spend) { try { spend = (await readWallet(rpc, me)).wallet; trackWallet(spend); lastWalletRead = now; } catch { /* unread: no bid on a guess */ } }
 
     const budgetOf = () => {
       if (!me) return cfg.maxRepay ?? 10n ** 15n;           // no wallet (scan mode): size bids as if funds were plenty
@@ -513,6 +556,23 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
     log.info(`${short(borrower)}: lost the race (the bid reverted${when || ': someone was first, or the price moved'})${n >= LOST_MAX ? ` · ${n} in a row: leaving it for ${LOST_PAUSE_MS / 60_000} min` : ''}`);
     if (n >= LOST_MAX) { cooldown.set(borrower, now + LOST_PAUSE_MS); lostRow.delete(borrower); }
   }
+  // how long until the next check, and why (the page shows it)
+  function setPace(now, price, readyN) {
+    if (price != null) { priceHist.push({ t: now, price }); while (priceHist.length && now - priceHist[0].t > 120_000) priceHist.shift(); }
+    const ref = [...priceHist].reverse().find((p) => now - p.t >= 55_000);
+    const fall = ref && price != null && ref.price > 0n ? Number(((ref.price - price) * 1_000_000n) / ref.price) / 1e6 : 0;
+    const hs = [...health].filter(([a]) => worth(a)).map(([, h]) => h);
+    const minH = hs.length ? Math.min(...hs) : Infinity;
+    const fmtH = (h) => (h === Infinity ? 'no open loans' : `closest loan at ${h.toFixed(3)}× health`);
+    if (readyN || shots.size || fresh.size || minH < AHEAD_HEALTH)
+      pace = { mode: 'fast', ms: cfg.tickSeconds * 1000, why: readyN ? 'a loan is past the line' : shots.size ? 'a timed bid is set' : fresh.size ? `reading ${fresh.size} loans` : fmtH(minH) };
+    else if (minH < cfg.hotHealth || fall >= FALL_WATCH)
+      pace = { mode: 'watch', ms: PACE.watchMs, why: fall >= FALL_WATCH ? `the oracle is ${(fall * 100).toFixed(1)}% lower than a minute ago` : fmtH(minH) };
+    else pace = { mode: 'calm', ms: PACE.calmMs, why: fmtH(minH) };
+  }
+  const nextDelayMs = () => pace.ms ?? cfg.tickSeconds * 1000;
+  const minWakeMs = () => WAKE_GAP_MS[pace.mode] ?? WAKE_GAP_MS.fast;
+
   function racesReport(now) {
     if (now - lastRaces < RACES_EVERY_MS) return;
     lastRaces = now;
@@ -574,7 +634,8 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       started, phase, live: !!cfg.live, liveNow: liveNow(), paused, hasWallet: !!sender, address: me,
       scan: bf, gas: gasView(lastView?.gasPrice, w?.eth ?? null),
       block: lastView?.block?.number ?? null, lastTickAt, lastError, oraclePaused: !!pausedSince,
-      rpc: st ? { host: st.host, ms: st.ms, fallback: st.fallback, error: st.lastError } : null,
+      rpc: st ? { host: st.host, ms: st.ms, fallback: st.fallback, error: st.lastError, perMin: st.perMin ?? null, budget: st.budget ?? null, slowed: !!st.slowed, limited: st.limited ?? 0 } : null,
+      pace: { mode: pace.mode, everySec: Math.round(nextDelayMs() / 100) / 10, why: pace.why },
       known: known.size, open: health.size, hot: [...health.values()].filter((h) => h < cfg.hotHealth).length, ready: lastReady, closest,
       wallet: w ? { ...Object.fromEntries(Object.keys(TOKENS).map((k) => [k, toNum(w[k], k)])), allowance: w.allowance == null ? null : Number(fmtUsdg(w.allowance)), at: walletAt } : null,
     };
@@ -591,7 +652,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   // the command line's scan and status wait for the whole chain scan
   const scanDone = async () => { while (!backfillDone) { if (backfillPromise) await backfillPromise.catch(() => null); if (!backfillDone && backfill?.error) throw new Error(backfill.error); } };
 
-  return { start, tick, refreshWallet, scanDone, sendTx, keepApproved, status, setSender, setPaused, freshStart, get busy() { return busy; }, get paused() { return paused; }, get started() { return started; }, get known() { return known; }, get health() { return health; }, get params() { return params; } };
+  return { start, tick, refreshWallet, scanDone, sendTx, keepApproved, status, setSender, setPaused, freshStart, nextDelayMs, minWakeMs, get busy() { return busy; }, get paused() { return paused; }, get started() { return started; }, get known() { return known; }, get health() { return health; }, get params() { return params; } };
 }
 
 export async function runLoop(bot, cfg, log, { signal } = {}) {

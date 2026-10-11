@@ -1,6 +1,6 @@
 {
-  "version": "1.6.0",
+  "version": "1.7.0",
   "date": "2026-10-11",
   "urgent": false,
-  "note": "Timed bids land on the right second: the oracle is read second by second near a crossing (the old straight-line estimate fired 1-2 s late), and the bid is signed ahead and sent without waiting behind other transactions."
+  "note": "About 9x fewer RPC calls (~110 a minute, was ~1,000): loans re-read only when an event names them, checks every 15 s when all loans are clear and down to 2 s near the line, and a 429 slows down on your RPC instead of switching."
 }

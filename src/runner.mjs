@@ -222,12 +222,14 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
 
   // ---- the live feed: a swap, an oracle checkpoint, a NAV or index move, or a market event wakes the loop at once ----
   let wakeUp = null, woken = false, watch = null, watchUrl = null;
-  const MIN_WAKE_MS = 250;                         // a burst of logs in one block is one check
+  // a burst of logs in one block is one check; when every loan is well clear, a busy pool can't make it check
+  // more than every few seconds (the bot's pace says how often)
+  const minWake = () => bot.minWakeMs?.() ?? 250;
   let lastWake = 0;
   const wake = (kind) => {
     log.debug?.(`live feed: ${kind}`);
     woken = true;
-    if (wakeUp) { const f = wakeUp; wakeUp = null; setTimeout(f, Math.max(0, lastWake + MIN_WAKE_MS - Date.now())); }
+    if (wakeUp) { const f = wakeUp; wakeUp = null; setTimeout(f, Math.max(0, lastWake + minWake() - Date.now())); }
   };
   function syncWatch() {
     if (cfg.wssUrl === watchUrl) return;
@@ -236,7 +238,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
   }
   // the timer, or the live feed, whichever comes first
   const nap = (ms, signal) => {
-    if (woken) { woken = false; return Promise.resolve(); }
+    if (woken) { woken = false; const gap = Math.max(0, lastWake + minWake() - Date.now()); return new Promise((r) => setTimeout(() => { lastWake = Date.now(); r(); }, Math.min(gap, ms))); }
     return new Promise((r) => {
       const t = setTimeout(done, ms);
       function done() { clearTimeout(t); wakeUp = null; woken = false; lastWake = Date.now(); r(); }
@@ -269,7 +271,9 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
       try { await bot.tick(); errors = 0; worked(); }
       catch (e) { errors++; failed(e); if (errors === 1 || errors % 30 === 0) log.warn(`tick failed (${errors} in a row): ${e.message}`); }
       await relay.flush().catch(() => null);
-      await nap(Math.max(200, cfg.tickSeconds * 1000 * (errors > 3 ? 3 : 1) - (Date.now() - t0)), signal);
+      // the bot's pace: every 15 s while every loan is well clear, down to TICK_SECONDS when one is about to cross
+      const every = bot.nextDelayMs?.() ?? cfg.tickSeconds * 1000;
+      await nap(Math.max(200, every * (errors > 3 ? 3 : 1) - (Date.now() - t0)), signal);
     }
   }
 

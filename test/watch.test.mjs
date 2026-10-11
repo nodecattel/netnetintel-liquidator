@@ -110,7 +110,7 @@ test('debug: a line per tick in the terminal (LOG_LEVEL=debug), never on the pag
   assert.deepEqual(real.recent().map((l) => l.msg), ['hello']);
   const bot = makeBot({ rpc, cfg: cfg(), store: store(), log, seed: async () => ({ accounts: [BAD, GOOD] }) });
   await bot.start(); await bot.tick();
-  assert.ok(log.lines.some((l) => /^debug tick 1 · block 84,606,976 · read 2 \(all\) loans in \d+ ms/.test(l)), log.lines.join('\n'));
+  assert.ok(log.lines.some((l) => /^debug tick 1 · block 84,606,976 · read 2 of 2 loans in \d+ ms/.test(l)), log.lines.join('\n'));
 });
 
 test('RPC: when your own RPC fails, the public one answers, and your own is used again once it is back', async () => {

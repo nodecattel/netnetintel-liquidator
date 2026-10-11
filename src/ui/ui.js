@@ -217,7 +217,7 @@ function limitsFields(s) {
     <label for="res">Keep in reserve (USDG)${fx('RESERVE_USDG')}</label><input id="res" type="number" min="0" step="1" value="${s.reserveUsdg ?? 0}">
     <label for="minp">Skip liquidations earning less than (USDG)${fx('MIN_PROFIT_USDG')}</label><input id="minp" type="number" min="0" step="0.05" value="${s.minProfitUsdg ?? 0.25}">
     <label><input type="checkbox" id="part" ${s.allowPartial ? 'checked' : ''}> Liquidate part of a loan when the wallet can't cover all of it${fx('ALLOW_PARTIAL')}</label>
-    <label for="tick">Check every (seconds)${fx('TICK_SECONDS')}</label><input id="tick" type="number" min="1" max="60" step="1" value="${s.tickSeconds}">`;
+    <label for="tick">Fastest check, near the line (seconds)${fx('TICK_SECONDS')} <span class="muted">(every 15 s while every loan is clear)</span></label><input id="tick" type="number" min="1" max="60" step="1" value="${s.tickSeconds}">`;
 }
 function readLimits() {
   return { maxRepayUsdg: $('max').value, reserveUsdg: $('res').value, minProfitUsdg: $('minp').value, allowPartial: $('part').checked, tickSeconds: $('tick').value };
@@ -229,12 +229,20 @@ function liveFeedLine(f) {
   if (f.connected) return `<b class="ok-t">Live feed on</b> (${esc(f.host || '')})${f.lastEventAt ? `: last woke the bot ${esc(ago(f.lastEventAt))} (${esc(f.lastKind || '')})` : ': waiting for the first event'}.`;
   return `<b class="warn-t">Live feed reconnecting</b>${f.error ? ` (${esc(f.error)})` : ''}: checks stay on the timer meanwhile.`;
 }
+// how hard the bot is using the RPC, and why it checks as often as it does
+function usageLine() {
+  const r = S.status.rpc, p = S.status.pace;
+  if (!r || r.perMin == null) return '';
+  const pace = p ? ` · checking every ${p.everySec} s: ${esc(p.why)}` : '';
+  return `<p class="hint"><b>${r.perMin.toLocaleString('en-US')} calls a minute</b> · up to ${r.budget} a second${r.slowed ? ' <span class="warn-t">(slowed: your RPC said "too many")</span>' : ''}${pace}. Each loan is read once and again only when an event on the market names it; checks speed up as a loan nears the line.</p>`;
+}
 function speedCard(s) {
   const r = S.status.rpc, fx = (k) => (s.fixed.includes(k) ? ' <span class="fixed">set by the environment</span>' : '');
   const now = r?.host ? `<b>${esc(r.host)}</b>${r.ms != null ? ` · about ${r.ms} ms a read` : ''}` : 'not connected yet';
   const e = s.endpoints || {};
   return `<div class="card" id="speed"><h2>Speed: RPC</h2>
     <p>Reading from ${now}${r?.fallback ? ' <span class="warn-t">(your RPC isn\'t answering: on the public one until it is back)</span>' : ''}.</p>
+    ${usageLine()}
     ${s.customRpc ? '' : '<div class="note">The public RPC is shared by everyone and rate-limited. Liquidations are a race, so your own RPC from a provider is faster and steadier. Most have a free tier.</div>'}
     <p class="hint">Providers with Robinhood Chain RPC:</p><div class="providers">${(s.providers || []).map(([name, url]) => `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(name)} ↗</a>`).join('')}</div>
     <label for="rpc">Your RPC address${fx('RPC_URL')} <span class="muted">(empty: the public RPC)</span></label><input id="rpc" type="text" autocomplete="off" spellcheck="false" placeholder="${s.customRpc ? esc(s.rpcUrl || 'saved') + ' (saved: type a new one to replace)' : 'https://…'}">
@@ -388,7 +396,7 @@ function dashboard() {
     S.wallet.locked ? '<div class="note bad">The wallet is locked: log out and in again to unlock it.</div>' : '',
     out ? `<div class="note bad">${esc(amt(out.amount))} ${esc(out.token)} left the bot wallet ${esc(ago(out.at))}, and the bot didn't send it. If that wasn't you, move what's left (Settings → Withdraw).</div>` : '',
     st.lastError ? `<div class="note bad">The last check failed: ${esc(st.lastError)}. ${/rate-limiting/.test(st.lastError)
-      ? (s.customRpc ? 'Your RPC was busy, and the public one it falls back to refused too. It retries on its own; if this keeps showing, your provider plan\'s requests-per-second limit is too low for checks every ' + s.tickSeconds + ' s: raise "Check every" in Settings, or the plan.' : 'The public RPC limits how often each address may call it. Your own RPC (Settings → Speed) avoids this.')
+      ? (s.customRpc ? 'Your RPC was busy, and the public one it falls back to refused too. It retries on its own; if this keeps showing, the bot already slows down when your RPC says "too many"; if this keeps showing, raise "Fastest check" in Settings, or your provider plan.' : 'The public RPC limits how often each address may call it. Your own RPC (Settings → Speed) avoids this.')
       : 'It retries on its own; if it keeps failing, check the RPC in Settings → Speed.'}</div>` : '',
     !st.started && !st.lastError ? `<div class="note">${st.phase === 'loading' ? 'Loading the open loans…' : 'Connecting to Robinhood Chain…'}</div>` : '',
     st.scan?.error ? `<div class="note warn">The full chain scan paused (${esc(st.scan.error)}); the bot keeps watching the loans it knows and resumes the scan on its own.</div>` : '',

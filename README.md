@@ -65,9 +65,26 @@ On a server you trust you can turn on *Stay unlocked after restarts* in Settings
 
 ## How it decides
 
-Every tick it reads the market, the oracle price, the interest rate and the loans near the line in one batch. It
-accrues interest to the current second and computes each loan the way Morpho will (`position()`, virtual shares,
-`_isHealthy`). Health is (collateral × oracle price × 62.5%) ÷ debt. Under 1.000, anyone can liquidate.
+Each check reads the market and the oracle price in one small batch. It accrues interest to the current second and
+computes every loan the way Morpho will (`position()`, virtual shares, `_isHealthy`). Health is (collateral × oracle
+price × 62.5%) ÷ debt. Under 1.000, anyone can liquidate.
+
+**Few reads, at the right pace.** A loan only changes through an event on the market (borrow, repay, collateral in or
+out, liquidation), so each loan is read once and again only when an event names it (one `eth_getLogs` per check finds
+them); between events its health follows from the oracle price and the interest. As a safety net a sweep re-reads 25
+wallets every 30 s in turn, loans under 1.10× health are re-read every 30 s, and a loan about to cross on every check.
+The wallet and the gas price are read every 30 s (every check while a bid may go out). How often it checks follows the
+closest loan: every 15 s while every loan is clear, every 6 s once one is under 1.10× or the oracle has fallen 0.5% in a
+minute, every `TICK_SECONDS` (2 s) when one is within 3% of the line or a timed bid is set. With the live feed, a swap,
+an oracle checkpoint or a market event checks at once, in any pace. Only loans worth a bid (one that would earn at
+least `MIN_PROFIT_USDG`) set the pace: the few cents a partial liquidation leaves behind don't. Measured on mainnet
+(11 Oct 2026, 174 open loans): about 110 RPC calls a minute with one loan under 1.10×, down from about 1,000.
+
+**A budget, not bursts.** Calls to each RPC host share a budget (10 a second to start) and batches are never bigger than
+a second of it. When your RPC answers 429 ("too many requests") the budget halves for a minute and the call is retried on
+your RPC after a short wait; it climbs back by one a second every 30 s. Only a batch your RPC refuses three times goes to
+the public RPC, quietly; it switches to the public RPC only when yours stops answering. The page's Settings → Speed shows
+the calls a minute, the budget and why it checks as often as it does.
 
 For a liquidatable loan, it sizes a bid with Morpho's own `liquidate()` arithmetic:
 

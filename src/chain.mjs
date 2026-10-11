@@ -22,13 +22,48 @@ export const ERC20 = new Interface([
 // url: a string, a list (the first that answers wins: your own RPC, then the public one), or a function returning either
 // (the local page can change the RPC while the bot runs). A node that fails at the transport level (down, HTTP error,
 // timeout) is skipped for SKIP_MS and the next one answers; JSON-RPC errors are answers and pass through.
+//
+// Every node gets a request budget (calls a second, shared by everything that talks to that host) that adapts: it
+// starts at RPC_BUDGET_START, halves on a 429 and climbs back by one every RECOVER_MS while the node keeps answering.
+// Batches are cut to the budget, so a burst never asks a node for more in one second than it allows. A 429 is retried
+// on the same node after a short wait (it is answering, just pacing us); only if it still refuses does that one batch
+// go to the next node, without leaving the first.
 const SKIP_MS = 30_000;
-export function makeRpc(url, { fetchImpl = fetch, batchSize = 40, timeoutMs = 15000, onFallback = () => {} } = {}) {
+export const RPC_BUDGET_START = 10, RPC_BUDGET_MIN = 2, RPC_BUDGET_MAX = 40, RECOVER_MS = 30_000, LIMITED_MS = 60_000;
+const RETRY_429_MS = [500, 1200];
+const BUDGETS = new Map();                                   // host → { rate, tokens, at, limitedUntil, raisedAt, limited }
+export function budgetOf(host, { start = RPC_BUDGET_START, now = Date.now } = {}) {
+  let b = BUDGETS.get(host);
+  if (!b) { b = { rate: start, tokens: start, at: now(), limitedUntil: 0, raisedAt: now(), limited: 0 }; BUDGETS.set(host, b); }
+  return b;
+}
+export function resetBudgets() { BUDGETS.clear(); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export function makeRpc(url, { fetchImpl = fetch, batchSize = 40, timeoutMs = 15000, onFallback = () => {}, budgetStart = RPC_BUDGET_START, now = Date.now, wait = sleep } = {}) {
   let id = 0;
   const down = new Map();                                    // url → until when it is skipped
-  const stats = { ms: null, host: null, fallback: false, calls: 0, errors: 0, lastError: null };
+  const stats = { ms: null, host: null, fallback: false, calls: 0, errors: 0, lastError: null, limited: 0, lastLimitedAt: null };
+  const recent = [];                                         // [ms, calls] over the last minute, for calls a minute
   const hostOf = (u) => { try { return new URL(u).host; } catch { return '?'; } };
   const urls = () => { const v = typeof url === 'function' ? url() : url; return [...new Set((Array.isArray(v) ? v : [v]).filter(Boolean))]; };
+  // wait until the host's budget has room for n calls (a batch bigger than one second's budget borrows ahead)
+  async function take(host, n) {
+    const b = budgetOf(host, { start: budgetStart, now });
+    for (;;) {
+      const t = now();
+      b.tokens = Math.min(b.rate, b.tokens + ((t - b.at) / 1000) * b.rate); b.at = t;
+      if (t >= b.limitedUntil && b.rate < RPC_BUDGET_MAX && t - b.raisedAt >= RECOVER_MS) { b.rate += 1; b.raisedAt = t; }
+      if (b.tokens >= Math.min(n, b.rate)) { b.tokens -= n; break; }
+      await wait(Math.ceil(((Math.min(n, b.rate) - b.tokens) / b.rate) * 1000));
+    }
+    recent.push([now(), n]);
+    while (recent.length && now() - recent[0][0] > 60_000) recent.shift();
+  }
+  function limited(host) {
+    const b = budgetOf(host, { start: budgetStart, now });
+    b.rate = Math.max(RPC_BUDGET_MIN, Math.floor(b.rate / 2)); b.tokens = 0; b.limitedUntil = now() + LIMITED_MS; b.raisedAt = now(); b.limited++;
+    stats.limited++; stats.lastLimitedAt = now();
+  }
   async function post(u, body) {
     const t0 = Date.now();
     const res = await fetchImpl(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
@@ -37,8 +72,10 @@ export function makeRpc(url, { fetchImpl = fetch, batchSize = 40, timeoutMs = 15
     let arr = null;
     try { arr = await res.json(); } catch { arr = null; }
     const rpcShaped = arr && (Array.isArray(arr) || typeof arr === 'object') && (Array.isArray(arr) ? arr.every((x) => x && x.jsonrpc) : !!arr.jsonrpc);
-    if (!rpcShaped || res.status === 429 || res.status >= 500 && !(arr && arr.error))
-      throw new Error(res.status === 429 || res.status === 403 ? `${hostOf(u)} is rate-limiting (HTTP ${res.status})` : `HTTP ${res.status} from ${hostOf(u)}`);
+    const tooMany = res.status === 429 || (rpcShaped && !Array.isArray(arr) && arr.error && (arr.error.code === 429 || arr.error.code === -32005 && /rate|limit|exceed/i.test(arr.error.message || '')));
+    if (tooMany) throw Object.assign(new Error(`${hostOf(u)} is rate-limiting (HTTP 429)`), { rateLimited: true });
+    if (!rpcShaped || res.status >= 500 && !(arr && arr.error) || res.status === 403)
+      throw new Error(res.status === 403 ? `${hostOf(u)} is refusing (HTTP 403)` : `HTTP ${res.status} from ${hostOf(u)}`);
     // one object for a batch: a refusal of the whole batch (QuickNode answers a batch it won't run with one error)
     if (!Array.isArray(arr)) arr = body.length === 1 && !arr.error ? [arr] : body.map((b) => ({ jsonrpc: '2.0', id: b.id, ...(body.length === 1 ? arr : { error: arr.error || { message: 'error' } }), }));
     const ms = Date.now() - t0;
@@ -47,21 +84,34 @@ export function makeRpc(url, { fetchImpl = fetch, batchSize = 40, timeoutMs = 15
   }
   async function batch(calls) {
     const body = calls.map((c) => ({ jsonrpc: '2.0', id: ++id, method: c.method, params: c.params }));
-    const list = urls(), now = Date.now();
-    const order = [...list.filter((u) => !(down.get(u) > now)), ...list.filter((u) => down.get(u) > now)];   // skipped nodes last, never none
+    const list = urls(), t = now();
+    const order = [...list.filter((u) => !(down.get(u) > t)), ...list.filter((u) => down.get(u) > t)];   // skipped nodes last, never none
     let lastErr = null;
     for (const [i, u] of order.entries()) {
+      const host = hostOf(u);
       try {
-        const arr = await post(u, body);
-        stats.calls++; stats.host = hostOf(u);
+        let arr;
+        for (let attempt = 0; ; attempt++) {
+          await take(host, body.length);
+          try { arr = await post(u, body); break; }
+          catch (e) {
+            if (!e.rateLimited) throw e;
+            limited(host);
+            if (attempt >= RETRY_429_MS.length) throw e;
+            await wait(RETRY_429_MS[attempt]);
+          }
+        }
+        stats.calls++; stats.host = host;
         const fb = u !== list[0];
-        if (fb !== stats.fallback) { stats.fallback = fb; onFallback(fb, hostOf(list[0]), stats.host, lastErr?.message); }
+        // one batch the main node was too busy for: answered here, quietly; the next goes back to the main node
+        if (fb && lastErr?.rateLimited) stats.overflow = (stats.overflow || 0) + 1;
+        else if (fb !== stats.fallback) { stats.fallback = fb; onFallback(fb, hostOf(list[0]), stats.host, lastErr?.message); }
         if (!fb) down.delete(u);
         const byId = new Map((Array.isArray(arr) ? arr : [arr]).map((r) => [r.id, r]));
         return body.map((b) => byId.get(b.id) || { error: { message: 'no answer' } });
       } catch (e) {
-        lastErr = e; stats.errors++; stats.lastError = `${hostOf(u)}: ${e.name === 'TimeoutError' ? 'timed out' : e.message}`;
-        down.set(u, Date.now() + SKIP_MS);
+        lastErr = e; stats.errors++; stats.lastError = `${host}: ${e.name === 'TimeoutError' ? 'timed out' : e.message}`;
+        if (!e.rateLimited) down.set(u, Date.now() + SKIP_MS);   // a node pacing us is still up: this batch goes elsewhere, the next comes back
         if (i === order.length - 1) throw new Error(`RPC ${stats.lastError}`);
       }
     }
@@ -70,12 +120,18 @@ export function makeRpc(url, { fetchImpl = fetch, batchSize = 40, timeoutMs = 15
   // together: one batch whatever the batch size, so one node answers every call (a head and the logs up to it)
   async function rpc(calls, { together = false } = {}) {
     if (together) return batch(calls);
+    const host = hostOf(urls()[0]);
+    const size = Math.max(5, Math.min(batchSize, Math.floor(budgetOf(host, { start: budgetStart, now }).rate)));   // never more in one batch than a second's budget
     const out = [];
-    for (let i = 0; i < calls.length; i += batchSize) out.push(...(await batch(calls.slice(i, i + batchSize))));
+    for (let i = 0; i < calls.length; i += size) out.push(...(await batch(calls.slice(i, i + size))));
     return out;
   }
   rpc.one = async (method, params) => { const [r] = await batch([{ method, params }]); if (r.error) throw rpcError(r.error); return r.result; };
-  rpc.stats = () => ({ ...stats });
+  rpc.stats = () => {
+    while (recent.length && now() - recent[0][0] > 60_000) recent.shift();
+    const b = BUDGETS.get(hostOf(urls()[0]));
+    return { ...stats, perMin: recent.reduce((a, [, n]) => a + n, 0), budget: b ? b.rate : budgetStart, slowed: !!(b && now() < b.limitedUntil) };
+  };
   return rpc;
 }
 export function rpcError(e) {
@@ -134,13 +190,15 @@ export async function readPricesAt(rpc, oracle, times) {
 // ahead: chain timestamps to also read the oracle's price at (eth_call with a block-time override). Between swaps the
 // TWAP keeps drifting toward the pool's price block by block, so the price a few seconds out is known now; a node that
 // doesn't take overrides just leaves these out (priceAhead: null).
-export async function readTick(rpc, params, me, borrowers, { rate: knownRate = null, ahead = [] } = {}) {
+// gas: false leaves the gas price out (read every 30 s, not every check); me: null leaves the wallet out
+export async function readTick(rpc, params, me, borrowers, { rate: knownRate = null, ahead = [], gas = true } = {}) {
   const calls = [
     { method: 'eth_getBlockByNumber', params: ['latest', false] },
     call(MORPHO, MORPHO_IFACE.encodeFunctionData('market', [MARKET_ID])),
     call(params.oracle, ORACLE.encodeFunctionData('price', [])),
-    { method: 'eth_gasPrice', params: [] },
-  ];
+    gas ? { method: 'eth_gasPrice', params: [] } : null,
+  ].filter(Boolean);
+  const gi = gas ? 3 : -1;
   const abase = calls.length;
   for (const t of ahead) calls.push({ method: 'eth_call', params: [{ to: params.oracle, data: ORACLE.encodeFunctionData('price', []) }, 'latest', {}, { time: '0x' + Math.floor(t).toString(16) }] });
   const wbase = calls.length;
@@ -154,7 +212,7 @@ export async function readTick(rpc, params, me, borrowers, { rate: knownRate = n
   const market = { totalSupplyAssets: mk[0], totalSupplyShares: mk[1], totalBorrowAssets: mk[2], totalBorrowShares: mk[3], lastUpdate: mk[4], fee: mk[5] };
   // the oracle reverts while its guard holds (pool far under the TWAP): no price, no liquidations
   const price = ok(r[2]) ? BigInt(r[2].result) : null;
-  const gasPrice = r[3]?.result ? BigInt(r[3].result) : null;
+  const gasPrice = gi >= 0 && r[gi]?.result ? BigInt(r[gi].result) : null;
   const pa = ahead.map((t, i) => (ok(r[abase + i]) ? { t: Math.floor(t), price: BigInt(r[abase + i].result) } : null));
   const priceAhead = ahead.length && pa.every(Boolean) ? pa : null;
   const wallet = me ? parseWallet(r.slice(wbase, base)) : null;
@@ -195,6 +253,25 @@ export async function scanBorrowers(rpc, from, to, { range = 2_000_000, minRange
     a = b + 1;
   }
   return found;
+}
+
+/** Every event on the Loopback market from `from` to `to` (one eth_getLogs, with the node's head in the same batch):
+ *  the wallets that borrowed (new loans) and every wallet an event names (borrow, repay, collateral in or out,
+ *  liquidation), whose position may have changed and is read again. A loan only changes through these events, so
+ *  between them its health follows from the oracle's price and the interest alone: no need to re-read it. */
+const BORROWER_TOPIC = { [TOPIC_BORROW]: 2 };
+export async function scanMarket(rpc, from, to) {
+  const [h, r] = await rpc([{ method: 'eth_blockNumber', params: [] }, { method: 'eth_getLogs', params: [{ address: MORPHO, topics: [null, MARKET_ID], fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16) }] }], { together: true });
+  const nodeHead = h?.result ? parseInt(h.result, 16) : null;
+  if (nodeHead == null || nodeHead < to) throw new Error(`the RPC node is behind (its block ${nodeHead ?? '?'}, asked up to ${to})`);
+  if (r.error || !Array.isArray(r.result)) throw new Error(`eth_getLogs refused ${from}-${to}: ${r.error?.message || 'no result'}`);
+  const borrowers = new Set(), touched = new Set();
+  for (const log of r.result) {
+    const t = log.topics || [];
+    if (BORROWER_TOPIC[t[0]] != null && t[BORROWER_TOPIC[t[0]]]) borrowers.add(getAddress('0x' + t[BORROWER_TOPIC[t[0]]].slice(26)));
+    for (const x of t.slice(2)) if (x && /^0x0{24}[0-9a-f]{40}$/i.test(x)) touched.add(getAddress('0x' + x.slice(26)));
+  }
+  return { borrowers, touched, events: r.result.length };
 }
 
 /** Simulate a call from `from`; null on success, else the revert reason. */

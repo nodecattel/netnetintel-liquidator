@@ -56,7 +56,7 @@ export function describe(cfg) {
     `bid size: up to ${u(cfg.maxRepay)}, keep ${u(cfg.reserve)} in reserve, partial bids ${cfg.allowPartial ? 'on' : 'off'}`,
     `minimum profit at the oracle price: ${(Number(cfg.minProfit) / 1e6).toFixed(2)} USDG`,
     `seized wsNET: ${cfg.payout ? 'sent to ' + cfg.payout : 'kept in the bot wallet'}`,
-    `checks: loans under ${cfg.hotHealth}× health every ${cfg.tickSeconds}s, every loan every ${cfg.fullEverySeconds}s`,
+    `checks: every 15 s while every loan is clear, every 6 s under ${cfg.hotHealth}× health, every ${cfg.tickSeconds}s near the line; each loan read again when an event names it`,
     `RPC: ${cfg.rpcUrl === PUBLIC_RPC ? 'the public Robinhood Chain RPC (rate-limited: your own is faster, see Settings → Speed)' : 'your own' + (cfg.rpcFallback ? ', the public one as fallback' : '')}${cfg.sequencerUrl ? ' · transactions also sent to the sequencer' : ''}`,
   ];
 }
