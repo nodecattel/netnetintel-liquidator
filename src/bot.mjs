@@ -6,7 +6,7 @@
 import { getAddress, MaxUint256, AbiCoder, keccak256 } from 'ethers';
 import { MORPHO, MARKET_ID, MARKET_FROM_BLOCK, MARKET_PARAMS, USDG, WSNET, EXPLORER_TX } from './constants.mjs';
 import { MORPHO_IFACE, ERC20, readParams, paramsTuple, readTick, readWallet, scanBorrowers, simulate } from './chain.mjs';
-import { accrue, positionView, planBid, fmtUsdg, fmtWs } from './math.mjs';
+import { accrue, positionView, planBid, crossingAt, fmtUsdg, fmtWs } from './math.mjs';
 
 // Interest keeps accruing between the read and the block the bid lands in: bids are sized (and approvals set) on the
 // debt as it will be HEADROOM_SEC from now, so the USDG Morpho pulls never exceeds what was planned or approved.
@@ -28,6 +28,14 @@ const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 // a contract said no (revert, custom error), as opposed to the RPC failing to answer
 export const isRevert = (e) => e?.code === 'CALL_EXCEPTION' || e?.code === 3 || /revert|execution reverted|healthy/i.test(String(e?.shortMessage || e?.reason || e?.message || ''));
 const LIQ_TOPIC = MORPHO_IFACE.getEvent('Liquidate').topicHash;
+// Timed bids. A loan that interest alone tips past the line crosses at a second that can be worked out in advance, and
+// other liquidators fire at that second: a bid sent after the next 2 s check (and a gas estimate) arrives a block late.
+// So a loan due to cross within SHOT_WINDOW_SEC gets its bid built ahead (nonce, fees, a fixed gas limit) and sent the
+// moment the chain's clock reaches that second. A bid that loses the race reverts and costs only its gas; after
+// LOST_MAX lost in a row on one borrower it is left alone for LOST_PAUSE_MS. Lost races go to Telegram once an hour.
+export const SHOT_WINDOW_SEC = 90, SHOT_GAS = 600_000n, LOST_MAX = 3, LOST_PAUSE_MS = 10 * 60_000, RACES_EVERY_MS = 60 * 60_000;
+const SHOT_LAG_MS = 120;            // after the chain clock reaches the second: lands in its first block, not the one before
+const CLOCK_SAMPLES = 30;
 
 // Wallet balances: units per token, the smallest change worth a word, and how a change is shown
 export const TOKENS = { eth: { dec: 18, dust: 10n ** 12n, sym: 'ETH' }, usdg: { dec: 6, dust: 10_000n, sym: 'USDG' }, wsnet: { dec: 18, dust: 10n ** 12n, sym: 'wsNET' },
@@ -69,6 +77,13 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
   { const ws = store.walletSeen?.(); if (ws?.at && (store.txs?.() || []).some((t) => t.status === 'unknown' || Date.parse(t.at) >= ws.at)) Object.assign(own, { open: true, until: nowMs() + OWN_MAX_MS }); }
   // addresses only NetNet Intel listed: watched, but saved only once the chain shows a loan (a wrong list can't grow the file)
   const seededOnly = new Set();
+  // timed bids: borrower → { at (chain second), timer, plan }; lost races in a row per borrower, and since the last report
+  const shots = new Map(), lostRow = new Map();
+  let lostSince = [], lastRaces = nowMs();
+  // chain clock − local clock, in seconds: the largest recent (latest block's timestamp − local time) (a block's
+  // timestamp is floored to the second and the read takes time, so the largest sample is the closest)
+  const clock = [];
+  const chainOffset = () => (clock.length ? Math.max(...clock) : 0);
 
   const once = (key, everyMs, f) => { if (said.size > 2000) said.clear(); const t = said.get(key); if (t && nowMs() - t < everyMs) return; said.set(key, nowMs()); f(); };
   const saveScan = () => store.setScan(backfillDone ? cursor : scanned, [...known].filter((a) => !seededOnly.has(a) || health.has(a)));
@@ -270,6 +285,9 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       if (v.liquidatable) ready.push({ borrower: b, pos, view: v });
     }
     if (everyone) for (const b of known) if (!view.positions.has(b)) { health.delete(b); debts.delete(b); }
+    if (view.block?.timestamp != null) { clock.push(view.block.timestamp - t0 / 1000); if (clock.length > CLOCK_SAMPLES) clock.shift(); }
+    await armShots(view, spend, nowSec, now);
+    racesReport(now);
     lastReady = ready.length;
     if (ready.length) dbg(`liquidatable: ${ready.map((r) => `${short(r.borrower)} ${(Math.floor(r.view.health * 1e4) / 1e4).toFixed(4)}`).join(', ')}`);
 
@@ -295,7 +313,7 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
 
     const results = [];
     for (const t of plans) {
-      if ((cooldown.get(t.borrower) ?? 0) > now) continue;
+      if ((cooldown.get(t.borrower) ?? 0) > now || shots.has(t.borrower)) continue;   // a timed bid is already on its way
       if (t.plan.skip) {
         once(`skip:${t.borrower}`, 600_000, () => log.info(`${short(t.borrower)} is liquidatable (health ${t.view.health.toFixed(4)}, debt ${fmtUsdg(t.view.debt)} USDG) but skipped: ${t.plan.skip}`));
         // a chance missed for want of USDG: worth telling the owner, at most hourly
@@ -348,6 +366,20 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       ({ hash: sent, receipt: rec } = await sendTx('liquidate', { ...tx, gasLimit: (gas * 13n) / 10n }, what, { check: needLive }));
       sent = { hash: sent };
       if (!rec || rec.status !== 1) throw new Error(`the transaction ${rec ? 'reverted' : 'was not confirmed in 2 minutes'} (${EXPLORER_TX}${sent.hash})`);
+      return await landed(t, sent, rec, now);
+    } catch (e) {
+      log.error(`${short(borrower)}: ${e.shortMessage || e.message}`);
+      notify(`Liquidation attempt on ${short(borrower)} failed: ${e.shortMessage || e.message}`, { key: `fail:${borrower}`, everyMs: 600_000 });
+      once(`failed:${borrower}`, 600_000, () => emit({ kind: 'failed', borrower, error: String(e.shortMessage || e.message).slice(0, 160) }));
+      cooldown.set(borrower, now + 30_000);
+      return { sent: false, borrower, error: e.message };
+    }
+  }
+
+  // a liquidation that landed: record it, tell the owner, pay the wsNET out
+  async function landed(t, sent, rec, now) {
+    const { borrower, plan } = t;
+    {
       const ev = rec.logs.find((l) => l.address?.toLowerCase() === MORPHO.toLowerCase() && l.topics?.[0] === LIQ_TOPIC);
       const d = ev ? MORPHO_IFACE.decodeEventLog('Liquidate', ev.data, ev.topics) : null;
       const repaid = d ? d.repaidAssets : plan.repaid, seized = d ? d.seizedAssets : plan.seized;
@@ -358,14 +390,83 @@ export function makeBot({ rpc, logsRpc = rpc, sender: initialSender = null, cfg,
       await notify(`Liquidated ${short(borrower)} on Loopback: repaid ${entry.repaid} USDG, seized ${entry.seized} wsNET (≈ +${entry.profitAtOracle} USDG at the oracle).\n${EXPLORER_TX}${sent.hash}`);
       if (cfg.payout) await payout(seized);
       cooldown.set(borrower, now + 5_000);
+      lostRow.delete(borrower);
       return { sent: true, borrower, tx: sent.hash, entry };
-    } catch (e) {
-      log.error(`${short(borrower)}: ${e.shortMessage || e.message}`);
-      notify(`Liquidation attempt on ${short(borrower)} failed: ${e.shortMessage || e.message}`, { key: `fail:${borrower}`, everyMs: 600_000 });
-      once(`failed:${borrower}`, 600_000, () => emit({ kind: 'failed', borrower, error: String(e.shortMessage || e.message).slice(0, 160) }));
-      cooldown.set(borrower, now + 30_000);
-      return { sent: false, borrower, error: e.message };
     }
+  }
+
+  // ---- timed bids ----
+  async function armShots(view, spend, nowSec, now) {
+    const live = liveNow() && me && rate != null && rate > 0n;
+    const keep = new Set();
+    if (live) {
+      let budget = spend?.usdg == null ? 0n : spend.usdg - cfg.reserve;
+      if (cfg.maxRepay != null && budget > cfg.maxRepay) budget = cfg.maxRepay;
+      for (const [b, pos] of view.positions) {
+        if (!(pos.borrowShares > 0n) || (cooldown.get(b) ?? 0) > now) continue;
+        const at = crossingAt(pos, view.market, rate, view.price, params.lltv, nowSec, SHOT_WINDOW_SEC);
+        if (at == null) continue;
+        const plan = planBid(pos, accrue(view.market, rate, at + 30), view.price, params.lltv, budget > 0n ? budget : 0n, { allowPartial: cfg.allowPartial });
+        if (plan.skip || plan.profit < cfg.minProfit) continue;
+        keep.add(b);
+        const have = shots.get(b);
+        if (have && have.at === at && have.plan.args.repaidShares === plan.args.repaidShares && have.plan.args.seizedAssets === plan.args.seizedAssets) continue;
+        if (have) clearTimeout(have.timer);
+        await arm(b, at, plan, view, spend);
+      }
+    }
+    for (const [b, s] of shots) if (!keep.has(b)) { clearTimeout(s.timer); shots.delete(b); }   // healed, repaid, or no longer due
+  }
+  async function arm(borrower, at, plan, view, spend) {
+    try {
+      if (spend?.allowance == null || spend.allowance < plan.repaid) await keepApproved(spend, plan.repaid);
+      const nonce = await sender.nonce();
+      const gp = view.gasPrice ?? 0n;
+      const tx = { to: MORPHO, data: MORPHO_IFACE.encodeFunctionData('liquidate', [paramsTuple(params), borrower, plan.args.seizedAssets, plan.args.repaidShares, '0x']),
+        gasLimit: SHOT_GAS, nonce, type: 2, maxFeePerGas: gp > 0n ? gp * 2n : undefined, maxPriorityFeePerGas: 0n };
+      const wait = Math.max(0, (at - chainOffset()) * 1000 + SHOT_LAG_MS - nowMs());
+      const shot = { at, plan, nonce, timer: null };
+      shot.timer = setTimeout(() => { fire(borrower, shot, tx).catch(() => null); }, wait);
+      shots.set(borrower, shot);
+      once(`armed:${borrower}:${at}`, 600_000, () => log.info(`${short(borrower)} crosses the line from interest in ${Math.round(wait / 1000)} s: a ${plan.mode} bid (repay ${fmtUsdg(plan.repaid)} USDG, +${fmtUsdg(plan.profit)}) goes out at that second`));
+    } catch (e) {
+      once(`arm:${borrower}`, 600_000, () => log.warn(`${short(borrower)}: could not prepare a timed bid (${e.shortMessage || e.message})`));
+    }
+  }
+  async function fire(borrower, shot, tx) {
+    if (shots.get(borrower) !== shot) return;
+    shots.delete(borrower);
+    if (!liveNow()) return;
+    const now = nowMs();
+    cooldown.set(borrower, now + 15_000);                          // the 2 s check leaves it to this bid
+    const what = `timed ${shot.plan.mode} bid on ${short(borrower)}: repay ${fmtUsdg(shot.plan.repaid)} USDG, seize ${fmtWs(shot.plan.seized)} wsNET (+${fmtUsdg(shot.plan.profit)})`;
+    let r;
+    try { r = await sendTx('liquidate', tx, what, { check: needLive }); }
+    catch (e) {
+      // usually the nonce moved (another transaction went first): the next check bids the normal way
+      cooldown.delete(borrower);
+      log.warn(`${short(borrower)}: the timed bid was not sent (${e.shortMessage || e.message})`);
+      return;
+    }
+    if (r.receipt?.status === 1) return landed({ borrower, plan: shot.plan }, { hash: r.hash }, r.receipt, now);
+    if (!r.receipt) return;                                        // unconfirmed: the transaction list shows it
+    const n = (lostRow.get(borrower) ?? 0) + 1;
+    lostRow.set(borrower, n);
+    lostSince.push({ borrower, at: now, block: r.receipt.blockNumber != null ? Number(r.receipt.blockNumber) : null });
+    log.info(`${short(borrower)}: lost the race (the bid reverted: someone was first, or the price moved)${n >= LOST_MAX ? ` · ${n} in a row: leaving it for ${LOST_PAUSE_MS / 60_000} min` : ''}`);
+    if (n >= LOST_MAX) { cooldown.set(borrower, now + LOST_PAUSE_MS); lostRow.delete(borrower); }
+  }
+  function racesReport(now) {
+    if (now - lastRaces < RACES_EVERY_MS) return;
+    lastRaces = now;
+    if (!lostSince.length) return;
+    const by = {};
+    for (const l of lostSince) by[l.borrower] = (by[l.borrower] || 0) + 1;
+    const n = lostSince.length;
+    lostSince = [];
+    const list = Object.entries(by).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([b, k]) => ({ borrower: b, n: k }));
+    emit({ kind: 'races', lost: n, borrowers: list });
+    notify(`Lost ${n} liquidation race${n === 1 ? '' : 's'} in the last hour: ${list.map((x) => `${short(x.borrower)} ×${x.n}`).join(', ')}. Another bot landed first; each lost bid only cost its gas.`);
   }
 
   // Morpho pulls the repaid USDG, so it needs an allowance: the wallet's spendable USDG (capped at MAX_REPAY_USDG), set

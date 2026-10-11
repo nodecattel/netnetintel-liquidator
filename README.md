@@ -79,6 +79,13 @@ Interest keeps accruing until the bid lands, so bids and the approval are sized 
 never pulls more than planned. It simulates the call right before sending. If another liquidator got there first,
 Morpho says "position is healthy" and nothing is sent.
 
+**Timed bids.** Most Loopback liquidations happen because interest alone pushes a loan over the line, at a second that
+can be worked out in advance, and other bots fire at that second. So for a loan due to cross within 90 seconds, the bot
+builds the bid ahead (nonce, fees, a fixed gas limit) and sends it the moment the chain's clock reaches that second,
+with no simulation first. If another bot lands first, the bid reverts and costs only its gas (a fraction of a cent).
+After 3 lost in a row on one borrower it leaves that loan alone for 10 minutes. Lost races are summed up once an hour
+on Telegram and in the feed.
+
 These figures were checked to the unit against a real Loopback liquidation (block 84,602,814): the bot's repaid and
 seized amounts equal the Liquidate event's.
 

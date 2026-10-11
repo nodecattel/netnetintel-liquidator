@@ -90,6 +90,18 @@ export function planBid(pos, m, price, lltv, budget, { allowPartial = true } = {
   return { mode, args, seized: out.seized, repaid: out.repaid, valueAtOracle, profit: valueAtOracle - out.repaid };
 }
 
+/** The first chain second in (fromSec, fromSec + maxSec] at which interest alone puts the position past the line, at this
+ *  price and rate (Morpho's liquidate() accrues to the block's timestamp first). null: already past it, no interest, or
+ *  not within maxSec. */
+export function crossingAt(pos, market, ratePerSec, price, lltv, fromSec, maxSec) {
+  const past = (t) => positionView(pos, accrue(market, ratePerSec, t), price, lltv).liquidatable;
+  fromSec = Math.floor(fromSec);
+  if (!(ratePerSec > 0n) || !(pos.borrowShares > 0n) || past(fromSec) || !past(fromSec + maxSec)) return null;
+  let lo = fromSec, hi = fromSec + maxSec;
+  while (hi - lo > 1) { const mid = Math.floor((lo + hi) / 2); if (past(mid)) hi = mid; else lo = mid; }
+  return hi;
+}
+
 export const fmtUsdg = (v) => (Number(v) / 1e6).toFixed(2);
 export const fmtWs = (v) => (Number(v) / 1e18).toFixed(4);
 export const usdgUnits = (x) => (x == null || x === '' ? null : BigInt(Math.round(Number(x) * 1e6)));

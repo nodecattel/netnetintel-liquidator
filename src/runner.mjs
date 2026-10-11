@@ -71,6 +71,7 @@ export function senderOf(wallet, rpcUrl, { sequencerUrl = null, fetchImpl = fetc
     estimateGas: (tx) => each((x) => x.estimateGas({ ...tx, from: wallet.address })),
     balance: () => each((x, p) => p.getBalance(wallet.address)),
     feeData: () => each((x, p) => p.getFeeData()),
+    nonce: () => each((x, p) => p.getTransactionCount(wallet.address, 'pending')),
     send: async (tx) => {
       const pop = await each((x) => x.populateTransaction({ ...tx, chainId: CHAIN_ID }));
       const raw = await signers[0].signTransaction(pop), hash = keccak256(raw);

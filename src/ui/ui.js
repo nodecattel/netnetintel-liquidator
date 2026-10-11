@@ -302,6 +302,7 @@ function feedLine(e) {
     case 'outflow': return ['bad', `${amt(e.amount)} ${e.token} left the wallet, not sent by the bot`];
     case 'liquidated': return ['ok', `Liquidated ${b(e.borrower)}: repaid ${e.repaid} USDG, seized ${e.seized} wsNET (+${e.profitAtOracle})`];
     case 'missed': return ['', `Missed ${b(e.borrower)}: another liquidator got there first`];
+    case 'races': return ['', `Lost ${e.lost} timed bid${e.lost === 1 ? '' : 's'} in the last hour (${(e.borrowers || []).map((x) => `${b(x.borrower)} ×${x.n}`).join(', ')}): another bot landed first`];
     case 'failed': return ['bad', `Attempt on ${b(e.borrower)} failed: ${e.error}`];
     case 'dry': return ['', `${e.paused ? 'Paused' : 'Dry run'}: would liquidate ${b(e.borrower)} (repay ${e.repaid} USDG, +${e.profit})`];
     case 'nofunds': return ['warn', `A loan with ${e.debt} USDG of debt was open to liquidate; the wallet had ${e.usdg ?? '?'} USDG`];

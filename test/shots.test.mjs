@@ -1,0 +1,69 @@
+// Timed bids: a loan that interest alone tips past the line gets its bid built ahead and sent at that second (no gas
+// estimate, the nonce and fees set in advance); a lost race is counted, three in a row leave the borrower alone, and
+// lost races are reported once an hour.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { getAddress } from 'ethers';
+import { makeBot, SHOT_GAS, LOST_MAX } from '../src/bot.mjs';
+import { MORPHO_IFACE } from '../src/chain.mjs';
+import { MORPHO, LLTV } from '../src/constants.mjs';
+import { accrue, positionView, crossingAt, toAssetsUp, ORACLE_PRICE_SCALE, WAD } from '../src/math.mjs';
+import { fakeRpc, POS, BAD, GOOD, PRICE, TS, MARKET } from './fake.mjs';
+
+const RATE = 0x2d95795f6n;   // the fake IRM's rate per second
+const market = { totalSupplyAssets: MARKET[0], totalSupplyShares: MARKET[1], totalBorrowAssets: MARKET[2], totalBorrowShares: MARKET[3], lastUpdate: MARKET[4], fee: MARKET[5] };
+const shares = POS[BAD][1];
+// the collateral that sits exactly at the line `ahead` seconds after TS (so it crosses then, from interest alone)
+const collCrossingIn = (ahead) => {
+  const debt = toAssetsUp(shares, accrue(market, RATE, TS + ahead).totalBorrowAssets, market.totalBorrowShares);
+  return (debt * WAD * ORACLE_PRICE_SCALE) / (PRICE * LLTV) + 1n;
+};
+
+test('crossingAt: the first second interest alone puts the loan past the line', () => {
+  const pos = { supplyShares: 0n, borrowShares: shares, collateral: collCrossingIn(40) };
+  const past = (t) => positionView(pos, accrue(market, RATE, t), PRICE, LLTV).liquidatable;
+  const at = crossingAt(pos, market, RATE, PRICE, LLTV, TS, 90);
+  assert.ok(at > TS && at <= TS + 41, `crossing at +${at - TS}s`);
+  assert.equal(past(at), true); assert.equal(past(at - 1), false);
+  assert.equal(crossingAt(pos, market, RATE, PRICE, LLTV, TS, 20), null, 'not within the window');
+  assert.equal(crossingAt(pos, market, 0n, PRICE, LLTV, TS, 90), null, 'no interest, no crossing');
+  const bad = { supplyShares: 0n, borrowShares: shares, collateral: POS[BAD][2] };
+  assert.equal(crossingAt(bad, market, RATE, PRICE, LLTV, TS, 90), null, 'already past: the normal check bids');
+});
+
+const quiet = { info() {}, warn() {}, error() {}, debug() {} };
+const memStore = () => { let s = { cursor: null, borrowers: [], history: [], txs: [] }; return { get cursor() { return s.cursor; }, borrowers: () => s.borrowers, history: () => s.history, setScan(c, b) { s.cursor = c; s.borrowers = [...b]; }, record(e) { s.history.push(e); }, recordTx(t) { s.txs.push(t); }, txs: () => s.txs, heartbeat() {} }; };
+const cfg = { live: true, tickSeconds: 2, fullEverySeconds: 30, hotHealth: 1.1, minProfit: 250_000n, reserve: 0n, maxRepay: null, allowPartial: true, payout: null, gasFloorWei: 0n, logRange: 1_000_000, minLogRange: 1000 };
+
+test('a loan due to cross in ~2 s: the bid is built ahead and sent at that second, with no gas estimate', async () => {
+  POS[BAD] = [0n, shares, collCrossingIn(2)];
+  delete POS[GOOD];
+  const { rpc } = fakeRpc({ usdg: 10_000n * 10n ** 6n, allowance: 10_000n * 10n ** 6n });
+  const sent = [], events = [];
+  let estimates = 0, status = 0, extra = 0;
+  const sender = { address: getAddress('0x1111111111111111111111111111111111111111'), nonce: async () => 7, estimateGas: async () => { estimates++; return 300_000n; },
+    send: async (tx) => { sent.push({ tx, at: Date.now() }); return { hash: '0x' + String(sent.length).padStart(64, '0'), wait: async () => ({ status, blockNumber: 1, logs: [] }) }; } };
+  const notes = [];
+  const bot = makeBot({ rpc, sender, cfg, store: memStore(), log: quiet, onEvent: (e) => events.push(e), notify: async (t) => { notes.push(t); }, nowMs: () => Date.now() + extra });
+  await bot.start();
+  const t0 = Date.now();
+  await bot.tick();
+  assert.equal(sent.length, 0, 'not yet past the line: nothing sent on the check');
+  await new Promise((r) => setTimeout(r, 3200));
+  assert.equal(sent.length, 1, 'the timed bid went out');
+  const { tx, at } = sent[0];
+  assert.equal(tx.to, MORPHO); assert.equal(tx.nonce, 7); assert.equal(tx.gasLimit, SHOT_GAS); assert.equal(tx.maxPriorityFeePerGas, 0n);
+  assert.equal(MORPHO_IFACE.decodeFunctionData('liquidate', tx.data)[1], BAD);
+  assert.equal(estimates, 0, 'no gas estimate before a timed bid');
+  assert.ok(at - t0 >= 1000 && at - t0 <= 3200, `sent ${at - t0} ms after the check`);
+  // it reverted: a lost race, reported in the hourly summary (not each time)
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(events.filter((e) => e.kind === 'races').length, 0);
+  extra = 61 * 60_000;
+  await bot.tick();
+  const races = events.find((e) => e.kind === 'races');
+  assert.equal(races?.lost, 1); assert.equal(races.borrowers[0].borrower, BAD);
+  assert.ok(notes.some((n) => /Lost 1 liquidation race/.test(n)));
+  assert.ok(LOST_MAX === 3);
+  status = 1;
+});
