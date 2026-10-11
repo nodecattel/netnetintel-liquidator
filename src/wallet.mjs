@@ -114,7 +114,8 @@ export async function openKeystore(env, pw) {
 export function walletFromSecret(secret) {
   const s = String(secret || '').trim();
   if (/^(0x)?[0-9a-fA-F]{64}$/.test(s)) return new Wallet(s.startsWith('0x') ? s : '0x' + s);
-  const words = s.toLowerCase().split(/\s+/).filter(Boolean);
+  // a phrase pasted from a numbered list ("1. abandon 2. ability…", "1)abandon", commas, new lines) imports too
+  const words = s.toLowerCase().replace(/[,;]/g, ' ').split(/\s+/).map((w) => w.replace(/^\d+[.):-]?/, '')).filter(Boolean);
   if ([12, 15, 18, 21, 24].includes(words.length)) {
     try { return Wallet.fromPhrase(words.join(' ')); } catch { throw new Error('that recovery phrase is not valid (check the words and their order)'); }
   }

@@ -33,7 +33,7 @@ async function api(path, body) {
 async function load() { S = await api('/api/state'); render(); }
 function err(id, e) { const el = $(id); if (el) el.textContent = e.message || e; }
 const busy = (btn, on, text) => { if (!btn) return; if (on) { btn.dataset.t = btn.textContent; btn.textContent = text || 'Working…'; btn.disabled = true; } else { btn.textContent = btn.dataset.t || btn.textContent; btn.disabled = false; } };
-function copyBtn(id, text) { const b = $(id); if (b) b.onclick = async () => { try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; setTimeout(() => { b.textContent = 'Copy'; }, 1400); } catch (e) { b.textContent = 'Select it'; } }; }
+function copyBtn(id, text) { const b = $(id); if (!b) return; const label = b.textContent; b.onclick = async () => { try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; setTimeout(() => { b.textContent = label; }, 1400); } catch (e) { b.textContent = 'Select it'; } }; }
 
 function render() {
   clearTimeout(timer);
@@ -146,11 +146,15 @@ function phraseScreen() {
     $app.innerHTML = `${head(`Write down these ${words.length} words`, 'The only backup of the bot\'s wallet')}${steps(1)}<div class="card">
       <p>Anyone with these words can take the bot wallet's funds. Without them, a lost computer means lost funds.</p>
       <div class="note warn">Write them on paper, in order. Don't screenshot them, email them, paste them into a chat or give them to an AI assistant. NetNet Intel and @netnetintel_bot will never ask for them.</div>
-      <div class="phrase">${words.map((x, i) => `<div><b>${i + 1}</b>${esc(x)}</div>`).join('')}</div>
+      <div class="phrase" id="phrase">${words.map((x, i) => `<div><b aria-hidden="true">${i + 1}</b>${esc(x)}</div>`).join(' ')}</div>
+      <div class="row mt6"><button class="copy" id="cpw">Copy the ${words.length} words</button><span class="small">One space between words, no numbers: the form every wallet imports. Paste them only into a password manager, then copy something else so they leave the clipboard.</span></div>
       <p class="small">Address <code>${esc(phrase.address)}</code></p>
       <label><input type="checkbox" id="ok"> I wrote the words down, in order</label>
       <div class="row"><button class="primary" id="go" disabled>Next: check them</button><button id="cancel">Start over</button></div></div>`;
     $('ok').onchange = (e) => { $('go').disabled = !e.target.checked; };
+    copyBtn('cpw', words.join(' '));
+    // selecting the words by hand copies them clean too: the numbers are left out, one space between words
+    $('phrase').addEventListener('copy', (e) => { e.preventDefault(); e.clipboardData.setData('text/plain', words.join(' ')); });
     $('go').onclick = () => { phrase.shown = true; render(); };
     $('cancel').onclick = async () => { await api('/api/wallet/cancel', {}).catch(() => null); phrase = null; render(); };
     return;

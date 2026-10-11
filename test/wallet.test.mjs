@@ -44,3 +44,12 @@ test('settings: dry run by default, bad numbers refused', () => {
   assert.throws(() => configFrom({ MIN_PROFIT_USDG: 'lots' }), /MIN_PROFIT_USDG/);
   assert.throws(() => configFrom({ PAYOUT_ADDRESS: '0x123' }), /PAYOUT_ADDRESS/);
 });
+
+test('a recovery phrase pasted as a numbered list, with commas or line breaks, imports the same wallet', async () => {
+  const { walletFromSecret } = await import('../src/wallet.mjs');
+  const { Wallet } = await import('ethers');
+  const w = Wallet.createRandom();
+  const words = w.mnemonic.phrase.split(' ');
+  for (const pasted of [words.join(' '), words.map((x, i) => `${i + 1}. ${x}`).join('\n'), words.map((x, i) => `${i + 1}${x}`).join(' '), words.join(', '), words.map((x, i) => `${i + 1}) ${x}`).join('  ')])
+    assert.equal(walletFromSecret(pasted).address, w.address, pasted.slice(0, 40));
+});

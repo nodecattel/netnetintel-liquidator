@@ -88,7 +88,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .note.ok{background:color-mix(in srgb,var(--brand) 12%,transparent);color:var(--brand)}
 .phrase{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px;margin:12px 0}
 .phrase div{background:var(--soft);border-radius:6px;padding:7px 9px;font:13px var(--mono);color:var(--fg)}
-.phrase div b{color:var(--muted);font-weight:400;margin-right:6px}
+.phrase div b{color:var(--muted);font-weight:400;margin-right:6px;user-select:none;-webkit-user-select:none}
 code,.mono{font-family:var(--mono);font-size:12.5px;overflow-wrap:anywhere}
 .big{font:400 30px/1.1 var(--display);letter-spacing:-.01em;color:var(--fg);margin:2px 0 4px}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
