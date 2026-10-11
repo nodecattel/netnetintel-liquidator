@@ -89,6 +89,13 @@ on Telegram and in the feed.
 These figures were checked to the unit against a real Loopback liquidation (block 84,602,814): the bot's repaid and
 seized amounts equal the Liquidate event's.
 
+## Updates
+
+When a new version is out, the page shows it at the top (what's new, and the command with a Copy button), and
+@netnetintel_bot tells you once on Telegram (an urgent fix: every 12 hours until you update). /liquidator shows the
+version you run. To update, run the start command again; the wallet, settings and Telegram link stay. The bot never
+updates itself: that would need the Docker socket, which would let anything that got into the bot control your Docker.
+
 ## One copy at a time
 
 Two copies of the bot would race each other for the same loans (and, on one wallet, for the same nonce). So:

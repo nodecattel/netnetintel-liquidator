@@ -17,6 +17,8 @@ import { makeWatch } from './watch.mjs';
 import { fmtUsdg, fmtWs } from './math.mjs';
 
 export const VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+/** a < b for x.y.z versions */
+export const olderThan = (a, b) => { const p = (v) => String(v).split('.').map((x) => parseInt(x, 10) || 0); const [x, y] = [p(a), p(b)]; for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i]; return false; };
 
 // One copy sends from a wallet at a time. Two copies sharing the same /data (one started by hand next to the starter's,
 // say) race each other's nonces and bids: the newest started takes over and the older one pauses. It writes
@@ -188,6 +190,19 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
       .catch(() => null).finally(() => { intelBusy = false; });
   };
 
+  // A newer release (NetNet Intel's /api/v1/liquidator, every 10 minutes): the page shows it with the command that
+  // updates; Telegram hears it from NetNet Intel itself (it sees this copy's version on each check-in).
+  let update = null, releaseAt = 0, releaseBusy = false;
+  const checkRelease = () => {
+    if (!intel.enabled || releaseBusy || Date.now() - releaseAt < 10 * 60_000) return;
+    releaseBusy = true; releaseAt = Date.now();
+    intel.release().then((r) => {
+      const next = r && olderThan(VERSION, r.latest) ? { ...r, current: VERSION } : null;
+      if (next && next.latest !== update?.latest) log.info(`liquidator ${next.latest} is out (this is ${VERSION})${next.urgent ? ': an urgent update' : ''}. Update: run the start command again`);
+      update = next;
+    }).catch(() => null).finally(() => { releaseBusy = false; });
+  };
+
   // Nothing fails silently: two minutes of failed checks (or of failing to start) is told to Telegram once, and so is
   // the recovery. A bot that stops altogether is noticed on the other side (no check-in for 15 minutes).
   const STALL_MS = 120_000;
@@ -241,7 +256,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
     let errors = 0;
     while (!signal?.aborted) {
       const t0 = Date.now();
-      refreshIntel();
+      refreshIntel(); checkRelease();
       await relay.poll(statusLine()).catch(() => null);
       syncPause();
       try { await bot.tick(); errors = 0; worked(); }
@@ -311,6 +326,7 @@ export async function makeRunner({ env, log, fetchImpl = fetch, makeSender = sen
         },
         status: bot.status(),
         feed: watch ? { ...watch.status(), auto: cfg.wssAuto } : null,
+        update,
         market: marketView(),
         telegram: { linked: relay.linked, paused: relay.paused, error: relay.lastError, revoked: relay.revoked, direct: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) },
         history: store.history().slice(-50).reverse(), txs: store.txs().slice(-40).reverse(), events: events.filter((e) => e.kind !== 'tx').slice(-30).reverse(), log: log.recent ? log.recent(60) : [],

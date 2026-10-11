@@ -396,6 +396,7 @@ function dashboard() {
     s.live && lowGas ? '<div class="note bad">Live, but out of ETH for gas: it can\'t send anything until you top it up. <a href="#" id="tofund">How to fund it</a></div>' : '',
     s.live && noUsdg ? '<div class="note warn">Live, but the wallet has no USDG to liquidate with. <a href="#" id="tofund2">How to fund it</a></div>' : '',
     t.paused ? '<div class="note warn">Paused from Telegram: resume it from /liquidator.</div>' : '',
+    S.update ? `<div class="note ${S.update.urgent ? 'bad' : 'warn'}"><b>${S.update.urgent ? 'Urgent update' : 'Update available'}: ${esc(S.update.latest)}</b> (this is ${esc(S.update.current)})${S.update.note ? `. ${esc(S.update.note)}` : ''}<br>Run the start command again; the wallet, settings and Telegram link stay.${S.update.macLinux ? `<div class="row mt6"><code class="cmd">${esc(S.update.macLinux)}</code><button class="copy" id="cpupd">Copy</button></div>` : ''}${S.update.windows ? `<span class="small">Windows: <a href="${esc(S.update.windows)}" target="_blank" rel="noopener">download start.bat</a> and double-click it.</span>` : ''}</div>` : '',
     S.superseded ? `<div class="note bad">Another copy of this liquidator started after this one (${S.superseded === 'lock' ? 'on this computer, same wallet' : 'on another machine, same Telegram link'}), so this copy sends nothing: two would race each other. Stop one of them. Run the start command again to keep just the newest here.</div>` : '',
     flash ? `<div class="note ok">${esc(flash)}</div>` : '',
   ].join('');
@@ -435,6 +436,7 @@ function dashboard() {
       ${S.history.map((h) => `<tr><td>${esc(when(h.at))}</td><td><code>${esc(short(h.borrower))}</code></td><td class="num">${esc(h.repaid)}</td><td class="num">${esc(h.seized)}</td><td class="num pos">+${esc(h.profitAtOracle)}</td><td><a href="${EXPLORER}/tx/${esc(h.tx)}" target="_blank" rel="noopener">tx ↗</a></td></tr>`).join('')}</tbody></table></div><p class="hint">* At the oracle price, in USDG.</p></div>` : ''}
     <div class="card"><h2>Activity</h2>${activity()}</div>`;
   copyBtn('cp', S.wallet.address || '');
+  if (S.update?.macLinux) copyBtn('cpupd', S.update.macLinux);
   for (const id of ['tofund', 'tofund2', 'tofund3', 'tofund4']) if ($(id)) $(id).onclick = (e) => { e.preventDefault(); view = 'fund'; render(); };
   for (const id of ['tospeed', 'tospeed2']) if ($(id)) $(id).onclick = (e) => { e.preventDefault(); view = 'settings'; render(); setTimeout(() => $('speed')?.scrollIntoView({ block: 'start' }), 0); };
   $('fulllog').ontoggle = (e) => { showLog = e.target.open; };

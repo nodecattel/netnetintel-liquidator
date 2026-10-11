@@ -1,0 +1,6 @@
+{
+  "version": "1.5.1",
+  "date": "2026-10-11",
+  "urgent": false,
+  "note": "Faster bids: a live feed over your RPC's wss:// address, timed bids that follow the TWAP's drift, and update notices on the page and in Telegram."
+}

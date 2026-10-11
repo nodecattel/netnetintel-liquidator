@@ -26,6 +26,15 @@ export function makeIntel({ base = INTEL_API, version = '?', fetchImpl = fetch, 
     if (!res.ok) throw new Error(`NetNet Intel API: HTTP ${res.status} on ${path.split('?')[0]}`);
     return res.json();
   }
+  /** The latest release (GET /api/v1/liquidator): { latest, urgent, note, update } or null */
+  async function release() {
+    if (!base) return null;
+    const j = await get('/liquidator');
+    return typeof j?.latest === 'string' && /^\d+\.\d+\.\d+$/.test(j.latest)
+      ? { latest: j.latest, urgent: !!j.urgent, note: typeof j.note === 'string' ? j.note.slice(0, 300) : null, date: typeof j.date === 'string' ? j.date.slice(0, 10) : null,
+        macLinux: typeof j.update?.macLinux === 'string' ? j.update.macLinux.slice(0, 200) : null, windows: typeof j.update?.windows === 'string' ? j.update.windows.slice(0, 200) : null }
+      : null;
+  }
   /** The open loans, riskiest first (up to 200: every open loan today). Addresses only; the chain gives the rest. */
   async function loans() {
     const j = await get('/loop?sort=health&limit=200');
@@ -71,7 +80,7 @@ export function makeIntel({ base = INTEL_API, version = '?', fetchImpl = fetch, 
     get context() { return ctx; },
     get lastError() { return lastError; },
     get lastAt() { return lastAt; },
-    loans, refresh,
+    loans, refresh, release,
   };
 }
 
